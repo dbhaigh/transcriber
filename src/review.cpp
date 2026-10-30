@@ -404,6 +404,7 @@ CalibrationReport evaluate_calibration(
     report.available = true;
     report.limitation.clear();
     report.brier_score = brier_sum / samples.size();
+    report.expected_calibration_error = 0.0;
     report.reliability_bins.reserve(reliability_bin_count);
     for (std::size_t index = 0; index < reliability_bin_count; ++index) {
         const auto count = bin_count[index];
@@ -411,6 +412,9 @@ CalibrationReport evaluate_calibration(
             count,
             count ? probability_sum[index] / count : 0.0,
             count ? static_cast<double>(correct_count[index]) / count : 0.0});
+        const auto& bin = report.reliability_bins.back();
+        *report.expected_calibration_error += static_cast<double>(count) / samples.size() *
+            std::abs(bin.mean_predicted_probability - bin.observed_accuracy);
     }
     return report;
 }

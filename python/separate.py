@@ -198,7 +198,8 @@ class LocalOnnxSeparator:
             raise ValueError("Local ONNX functions require a reviewed adapter; use a self-contained graph")
         del inspected
         providers = {"cpu": "CPUExecutionProvider", "cuda": "CUDAExecutionProvider",
-                     "directml": "DmlExecutionProvider", "rocm": "ROCMExecutionProvider"}
+                     "directml": "DmlExecutionProvider", "rocm": "ROCMExecutionProvider",
+                     "tensorrt": "TensorrtExecutionProvider"}
         selected = providers[provider]
         if selected not in ort.get_available_providers():
             raise RuntimeError(f"{selected} unavailable; installed: {ort.get_available_providers()}; "
@@ -289,7 +290,7 @@ def main():
     parser.add_argument("input", type=Path)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--target", choices=("guitar", "bass", "piano", "voice"), required=True)
-    parser.add_argument("--provider", choices=("cpu", "cuda", "directml", "rocm"), default="cpu")
+    parser.add_argument("--provider", choices=("cpu", "cuda", "directml", "rocm", "tensorrt"), default="cpu")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--warmups", type=int, default=1)

@@ -236,8 +236,23 @@
         `ONNX Runtime · CPU · ${model.split(/[\\/]/).pop()}`;
     } else if (model) {
       $("model-status").textContent = "ONNX model selected but unavailable in this build";
+    } else if ($("polyphonic").checked) {
+      $("model-status").textContent = "Built-in spectral DSP · polyphonic note tracking · heuristic chords";
     } else {
       $("model-status").textContent = "Built-in YIN · monophonic";
+    }
+  }
+
+  function appendPolyphonicSummary(message) {
+    if (Array.isArray(message.chords) && message.chords.length) {
+      const names = message.chords.slice(0, 24).map((chord) =>
+        `${chord.onset_seconds.toFixed(2)}s ${chord.name}`);
+      $("result-message").textContent += `\nDetected harmony (heuristic): ${names.join(", ")}` +
+        (message.chords.length > 24 ? " ..." : "");
+    }
+    if (message.polyphonic_diagnostics?.refused_note_starts) {
+      $("result-message").textContent +=
+        `\nPolyphony limit: ${message.polyphonic_diagnostics.refused_note_starts} note-start candidates refused.`;
     }
   }
 
@@ -489,7 +504,7 @@
     $("tab-alternatives").disabled = busy;
     $("preserve-timing").disabled = busy;
     updateAnalysisControlState();
-    $("polyphonic").disabled = busy || !window.transcribeConfig?.onnx;
+    $("polyphonic").disabled = busy || mode === "asio";
     $("open-folder-button").disabled = busy;
     $("status-output-folder").disabled = busy;
     $("drop-browse").disabled = busy;
@@ -732,9 +747,14 @@
       const visualState = note.live_visual_state ||
         (note.finalized ? "finalized" : note.state || "");
       row.dataset.liveState = visualState;
+      row.dataset.confidenceBand = note.confidence_assessment?.band || "unassessed";
+      const assessmentLabel = confidenceLabel(note);
+      row.title = [assessmentLabel, ...(note.confidence_assessment?.reasons || [])]
+        .join("; ").replaceAll("-", " ");
       row.setAttribute("aria-label",
         `${note.name}, onset ${Number(note.start).toFixed(2)} seconds` +
-        (visualState ? `, ${visualState.replaceAll("_", " ")}` : ""));
+        (visualState ? `, ${visualState.replaceAll("_", " ")}` : "") +
+        (assessmentLabel ? `, ${assessmentLabel}` : ""));
       row.querySelector(".note-color").style.background =
         note.user_authored ? "#e9c578" : note.uncertain ? "#ff9b8e"
           : note.state === "provisional" ? "#96b5ff"
@@ -743,7 +763,7 @@
       row.querySelector(".note-name").textContent = note.name;
       row.querySelector(".note-time").textContent =
         `${Number(note.start).toFixed(2)}s · ${Number(note.duration).toFixed(2)}s`;
-      row.querySelector(".note-confidence").textContent = note.uncertain
+      row.querySelector(".note-confidence").textContent = assessmentLabel || (note.uncertain
         ? "UNCERTAIN"
         : visualState === "retracted" ? "RETRACTED"
           : visualState === "corrected" ? "CORRECTED"
@@ -756,9 +776,54 @@
             ? `${Math.round(Math.max(0, Math.min(1, note.calibrated_confidence)) * 100)}% calibrated`
           : Number.isFinite(note.confidence)
             ? `score ${note.confidence.toFixed(2)}`
-            : "—";
+            : "—");
     });
   }
+
+  function confidenceLabel(note) {
+    const assessment = note.confidence_assessment;
+    if (note.user_authored) return "USER EDIT · unassessed";
+    if (!assessment) return "";
+    if (assessment.band === "user-edited") return "USER EDIT · unassessed";
+    if (Number.isFinite(assessment.calibrated_probability))
+      return `${assessment.band.toUpperCase()} · ${Math.round(assessment.calibrated_probability * 100)}% calibrated`;
+    if (Number.isFinite(assessment.evidence_score))
+      return `${assessment.band.toUpperCase()} · score ${assessment.evidence_score.toFixed(2)}`;
+    return "UNASSESSED";
+  }
+
+  function renderConfidenceReport(report) {
+    const summary = $("confidence-summary");
+    const phrases = $("phrase-confidence");
+    phrases.replaceChildren();
+    if (!report || !report.transcription?.note_count) {
+      summary.textContent = "No accepted confidence assessment.";
+      return;
+    }
+    const describe = (value) => {
+      const evidence = Number.isFinite(value.mean_evidence_score)
+        ? `Evidence mean ${value.mean_evidence_score.toFixed(2)} (heuristic)` : "Evidence unavailable";
+      const calibrated = Number.isFinite(value.mean_calibrated_probability)
+        ? `; calibrated mean ${(value.mean_calibrated_probability * 100).toFixed(0)}% on ${value.calibrated_notes} notes`
+        : "; not calibrated";
+      return `${evidence}${calibrated}; assessed ${value.assessed_notes}/${value.note_count}; ${value.low_notes} low.`;
+    };
+    summary.textContent = describe(report.transcription);
+    for (const phrase of (report.phrases || []).slice(0, 100)) {
+      const item = document.createElement("li");
+      item.textContent = `${phrase.start_seconds.toFixed(2)}–${phrase.end_seconds.toFixed(2)}s: ${describe(phrase.summary)}`;
+      phrases.appendChild(item);
+    }
+    if (report.phrases?.length > 100) {
+      const item = document.createElement("li");
+      item.textContent = `${report.phrases.length - 100} additional phrases are available in JSON and MusicXML metadata.`;
+      phrases.appendChild(item);
+    }
+  }
+
+  window.addEventListener("transcribe:metadata", (event) => {
+    renderConfidenceReport(event.detail?.confidence_report);
+  });
 
   function renderNotes(nextNotes, final = false, notifyEditor = true) {
     if (!final && notifyEditor && Array.isArray(nextNotes) && nextNotes.length === notes.length &&
@@ -766,10 +831,11 @@
           const previous = notes[index];
           return ["id", "revision", "midi", "start", "duration", "state", "finalized",
             "user_authored", "uncertain", "string", "fret", "calibrated_confidence",
-            "live_visual_state", "live_visual_opacity"]
+            "live_visual_state", "live_visual_opacity", "confidence_assessment"]
             .every(key => note[key] === previous[key]);
         })) return;
     notes = Array.isArray(nextNotes) ? nextNotes : [];
+    renderConfidenceReport(null);
     rollIndex = window.TranscribeTimeline.index(notes);
     pitchLow = notes.reduce((low, note) => Math.min(low, note.midi), 127);
     pitchHigh = notes.reduce((high, note) => Math.max(high, note.midi), 0);
@@ -894,6 +960,13 @@
         context.setLineDash([]);
       } else {
         context.fill();
+      }
+      if (note.confidence_assessment?.band === "low") {
+        context.setLineDash([3, 2]);
+        context.strokeStyle = document.body.dataset.theme === "light" ? "#795100" : "#e9c578";
+        context.lineWidth = 2;
+        context.stroke();
+        context.setLineDash([]);
       }
       if (visualState === "stabilized") {
         context.fillStyle = color;
@@ -1398,7 +1471,7 @@
       $("asio-mode").disabled = !message.asio;
       document.querySelectorAll('[data-field="model"]').forEach((button) => button.disabled = !message.onnx);
       $("model-path").disabled = !message.onnx;
-      $("polyphonic").disabled = !message.onnx;
+      $("polyphonic").disabled = mode === "asio";
       $("live-backend").querySelector('option[value="onnx"]').disabled = !message.onnx;
       if (!message.onnx && $("live-backend").value === "onnx") {
         $("live-backend").value = "yin";
@@ -1667,6 +1740,7 @@
       setActivity("completed", "New proposal ready", "Review the proposal before replacing the accepted score.");
       $("result-message").textContent = message.summary ||
         `A new analysis proposal is available. Accepted score revision ${message.accepted_revision} remains unchanged.`;
+      appendPolyphonicSummary(message);
       $("result-message").className = "result-message";
       const proposalNotes = Array.isArray(message.notes) ? message.notes : [];
       $("proposal-summary").textContent = proposalNotes.length
@@ -1725,6 +1799,7 @@
         if (message.preprocessing_diagnostic) {
           $("result-message").textContent += `\n${message.preprocessing_diagnostic}`;
         }
+        appendPolyphonicSummary(message);
         if (message.project_opened) {
           $("isolation-enabled").checked = false;
           $("isolation-reviewed").checked = false;
@@ -2147,6 +2222,7 @@
   });
   inputs.model.addEventListener("input", updateAnalysisControlState);
   inputs.model.addEventListener("input", updateModelStatus);
+  $("polyphonic").addEventListener("change", updateModelStatus);
   $("latency-ms").addEventListener("change", savePaths);
   $("live-hop-ms").addEventListener("change", savePaths);
   $("asio-device").addEventListener("change", () => {
@@ -2187,6 +2263,7 @@
   $("tempo-control").addEventListener("change", savePaths);
   window.addEventListener("transcribe:edited", (event) => {
     renderNotes(event.detail.notes, false, false);
+    $("confidence-summary").textContent = "Pending edits: aggregate confidence updates after export.";
     if (captureActive && Array.isArray(event.detail.changes)) {
       if (event.detail.changes.length) send("live-edit", {
         batch: event.detail.changes.map(change => new URLSearchParams(change).toString()).join(";"),

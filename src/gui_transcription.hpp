@@ -5,6 +5,7 @@
 #include "transcribe/asio_capture.hpp"
 #include "transcribe/score.hpp"
 #include "transcribe/transcriber.hpp"
+#include "transcribe/polyphonic_pipeline.hpp"
 
 #include <filesystem>
 #include <cstdint>
@@ -54,6 +55,7 @@ struct Result {
     std::uint64_t audio_frame_count{};
     bool review_evidence_truncated{};
     std::string preprocessing_diagnostic;
+    std::optional<PolyphonicTranscription> polyphonic;
 #ifdef TRANSCRIBE_ENABLE_VEROVIO
     std::string musicxml_source;
 #endif

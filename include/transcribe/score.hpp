@@ -12,7 +12,8 @@
 
 namespace transcribe {
 
-inline constexpr std::uint32_t score_schema_version = 1;
+inline constexpr std::uint32_t score_schema_version = 2;
+inline constexpr std::uint32_t legacy_score_schema_version = 1;
 
 enum class ScoreEditOrigin { Inference, User, Migration, Refinement, Undo, Redo };
 
@@ -70,8 +71,48 @@ struct ScoreNote {
     bool tie_start{};
     bool tie_stop{};
     bool user_authored{};
+    bool user_accepted{};
     std::uint64_t revision{};
     ScoreEditProvenance provenance;
+};
+
+enum class ScoreCorrectionKind {
+    Accepted,
+    Rejected,
+    Inserted,
+    Deleted,
+    PitchAdjusted,
+    TimingAdjusted,
+    Split,
+    Merged,
+};
+
+struct ScoreCorrectionNoteSnapshot {
+    std::string note_id;
+    std::vector<std::string> source_event_ids;
+    int sounding_midi_pitch{};
+    double measured_onset_seconds{};
+    double measured_offset_seconds{};
+    double corrected_onset_seconds{};
+    double corrected_offset_seconds{};
+    double onset_quarters{};
+    double duration_quarters{};
+    bool user_authored{};
+    bool user_accepted{};
+
+    bool operator==(const ScoreCorrectionNoteSnapshot&) const = default;
+};
+
+struct ScoreCorrection {
+    std::string id;
+    ScoreCorrectionKind operation{ScoreCorrectionKind::PitchAdjusted};
+    std::uint64_t revision{};
+    std::string actor;
+    std::string reason;
+    std::string command_id;
+    bool active{true};
+    std::vector<ScoreCorrectionNoteSnapshot> before;
+    std::vector<ScoreCorrectionNoteSnapshot> after;
 };
 
 struct ScoreRest {
@@ -132,6 +173,7 @@ struct ScoreDocument {
     std::vector<ScoreRest> rests;
     std::vector<ScoreTabNote> tab_notes;
     std::vector<ScoreReviewDecision> review_decisions;
+    std::vector<ScoreCorrection> corrections;
     std::vector<ScoreRevisionRecord> history;
 };
 
@@ -141,6 +183,14 @@ struct InsertScoreNote {
 
 struct DeleteScoreElement {
     std::string element_id;
+};
+
+struct AcceptScoreNote {
+    std::string note_id;
+};
+
+struct RejectScoreNote {
+    std::string note_id;
 };
 
 struct ChangeScorePitch {
@@ -197,7 +247,8 @@ struct RecordReviewDecision {
 };
 
 using ScoreEditCommand = std::variant<
-    InsertScoreNote, DeleteScoreElement, ChangeScorePitch, ChangeScoreDuration,
+    InsertScoreNote, DeleteScoreElement, AcceptScoreNote, RejectScoreNote,
+    ChangeScorePitch, ChangeScoreDuration,
     SplitScoreNote, MergeScoreNotes, InsertScoreRest, ChangeScoreFingering,
     ReinterpretScoreRhythm, UpdateScoreContext, RecordReviewDecision>;
 

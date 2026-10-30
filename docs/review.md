@@ -7,6 +7,11 @@ capture or the audio callback.
 
 ## Evidence and confidence
 
+The shared [note/phrase/transcription confidence layer](confidence.md) adds
+derived evidence scores, assessment coverage, export metadata and uncertainty
+visualization without modifying review evidence. Its calibration methodology
+defines the conditions under which producers may supply event probabilities.
+
 The canonical score keeps detector evidence separately from calibrated
 confidence. An evidence sample records its time, pitch, raw detector strength,
 voicing value, optional model activation, and semantics such as `heuristic-score`,
@@ -22,7 +27,8 @@ current transcription workflow reports no calibrated estimates and does not
 assess out-of-distribution inputs.
 
 `evaluate_calibration` provides diagnostics, not a fitted calibration model.
-It reports Brier score and reliability bins only when the caller identifies a
+It reports Brier score, expected calibration error (ECE) and reliability bins
+only when the caller identifies a
 sufficiently large labelled dataset that is held out from training,
 representative of deployment, and has had training overlap reviewed. Its
 default minimum is 100 examples. The dataset identity and eligibility are

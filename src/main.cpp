@@ -1,4 +1,6 @@
 #include "transcribe/asio_capture.hpp"
+#include "transcribe/confidence.hpp"
+#include "transcribe/musical_analysis.hpp"
 #include "transcribe/audio.hpp"
 #include "transcribe/guitar_tab.hpp"
 #include "transcribe/musicxml.hpp"
@@ -108,10 +110,12 @@ struct Options {
     bool asio{};
     bool polyphonic{};
     bool competing_polyphony{};
+    bool tracked_polyphony{};
     transcribe::PitchObjective model_objective{transcribe::PitchObjective::Unspecified};
     transcribe::NeuralNoteDecoder neural_decoder{transcribe::NeuralNoteDecoder::Legacy};
     bool fast_preview{};
     bool benchmark{};
+    bool confidence_details{};
     bool bounded_inference{};
     bool preserve_expressive_timing{};
     transcribe::QuantizationMode quantization_mode{transcribe::QuantizationMode::Legacy};
@@ -149,10 +153,10 @@ void print_usage(std::ostream& output) {
               "  --backend <registry-id>     Opt-in offline model adapter (e.g. builtin:yin)\n"
               "  --neural-decoder <speed|quality>  Basic Pitch legacy/events modes; measured tradeoffs in docs\n"
               "  --bounded-inference         Bounded WAV windows; requires an explicit --backend\n"
-              "  --provider <name>           ONNX provider: cpu, cuda, directml, or rocm\n"
+              "  --provider <name>           ONNX provider: cpu, cuda, directml, rocm, or tensorrt\n"
               "  --device-id <number>        GPU device index for the selected provider\n"
               "  --polyphonic                Enable multi-pitch analysis (built-in or ONNX)\n"
-              "  --polyphonic-decoder <name> legacy or competing (experimental harmonic/ONNX heads)\n"
+              "  --polyphonic-decoder <name> legacy, competing, or tracked (finite polyphonic note/chord pipeline)\n"
               "  --model-objective <name>    independent-multi-pitch or monophonic (generic ONNX)\n"
               "  --instrument <name>         Apply guitar, bass, piano, or voice prior (not source recognition)\n"
               "  --isolated-audio <wav>       Transcribe a reviewed, zero-offset aligned stem instead of the mixture\n"
@@ -181,6 +185,7 @@ void print_usage(std::ostream& output) {
               "  --live-stabilized-target-ms <N>  Stabilized publication target (>= provisional)\n"
               "  --live-hop-ms <N>           Fixed-window update interval; context/thresholds unchanged\n"
               "  --minimum-confidence <0..1> Drop notes below this confidence\n"
+              "  --confidence-details       Print note and phrase evidence/confidence details\n"
               "  --benchmark                 Report analysis time and real-time factor\n"
               "  --config <path>             Load defaults from simple key=value config\n"
               "  --output-dir <directory>    Batch output directory (default: <input>/transcriber-output)\n"
@@ -256,8 +261,11 @@ transcribe::OnnxExecutionProvider parse_onnx_provider(const std::string& value) 
     if (value == "rocm") {
         return transcribe::OnnxExecutionProvider::Rocm;
     }
+    if (value == "tensorrt") {
+        return transcribe::OnnxExecutionProvider::TensorRT;
+    }
     throw std::invalid_argument(
-        "ONNX provider must be one of: cpu, cuda, directml, rocm.");
+        "ONNX provider must be one of: cpu, cuda, directml, rocm, tensorrt.");
 }
 
 std::array<int, 6> parse_guitar_tuning(const std::string& value) {
@@ -321,7 +329,7 @@ std::map<std::string, std::string> read_config(const std::filesystem::path& path
 }
 
 void apply_config(Options& options, const std::map<std::string, std::string>& values) {
-    static constexpr std::array<std::string_view, 53> supported_keys{
+    static constexpr std::array<std::string_view, 54> supported_keys{
         "input", "musicxml", "tab", "midi", "json", "events-json", "project",
         "score-project", "model", "provider",
         "device-id", "latency-ms", "tempo", "key-fifths", "mode", "meter",
@@ -333,7 +341,7 @@ void apply_config(Options& options, const std::map<std::string, std::string>& va
         "live-stabilized-target-ms", "live-hop-ms", "string-tuning", "fret-count",
         "guitar-min-midi", "guitar-max-midi", "isolated-audio", "preprocess-fallback",
         "batch-manifest", "batch-results", "progress-jsonl", "concurrency",
-        "memory-limit-mb", "resume", "batch"};
+        "memory-limit-mb", "resume", "batch", "confidence-details"};
     for (const auto& [key, value] : values) {
         (void)value;
         if (std::find(supported_keys.begin(), supported_keys.end(), key) ==
@@ -523,6 +531,8 @@ void apply_config(Options& options, const std::map<std::string, std::string>& va
     if (quiet != values.end()) {
         options.quiet = parse_config_bool(quiet->second, "quiet");
     }
+    if (const auto found = values.find("confidence-details"); found != values.end())
+        options.confidence_details = parse_config_bool(found->second, "confidence-details");
 }
 
 std::string next_value(int& index, int argc, char* argv[], const std::string& option) {
@@ -649,10 +659,11 @@ Options parse_options(int argc, char* argv[]) {
             options.polyphonic = true;
         } else if (argument == "--polyphonic-decoder") {
             const auto value = next_value(i, argc, argv, argument);
-            if (value != "legacy" && value != "competing") {
-                throw std::invalid_argument("Polyphonic decoder must be legacy or competing");
+            if (value != "legacy" && value != "competing" && value != "tracked") {
+                throw std::invalid_argument("Polyphonic decoder must be legacy, competing or tracked");
             }
             options.competing_polyphony = value == "competing";
+            options.tracked_polyphony = value == "tracked";
         } else if (argument == "--model-objective") {
             const auto value = next_value(i, argc, argv, argument);
             if (value == "independent-multi-pitch") {
@@ -684,6 +695,8 @@ Options parse_options(int argc, char* argv[]) {
             options.bounded_inference = true;
         } else if (argument == "--quiet") {
             options.quiet = true;
+        } else if (argument == "--confidence-details") {
+            options.confidence_details = true;
         } else if (argument == "--batch") {
             options.batch_directory = utf8_path(next_value(i, argc, argv, argument));
         } else if (argument == "--batch-manifest") {
@@ -750,6 +763,16 @@ Options parse_options(int argc, char* argv[]) {
          (!options.backend.empty() && options.backend != "onnx:basic-pitch-v1"))) {
         throw std::invalid_argument(
             "--neural-decoder events requires --model, --polyphonic and Basic Pitch (ASIO also requires --live-pipeline)");
+    }
+    if (options.tracked_polyphony) {
+        if (!options.polyphonic || options.asio || options.live_pipeline || options.bounded_inference ||
+            options.neural_decoder != transcribe::NeuralNoteDecoder::Legacy)
+            throw std::invalid_argument(
+                "Tracked polyphony requires --polyphonic with finite file input; not live, bounded or --neural-decoder events");
+        const auto backend = options.model.empty() ? "builtin:spectral" : "onnx:basic-pitch-v1";
+        if (!options.backend.empty() && options.backend != backend)
+            throw std::invalid_argument("Tracked polyphony requires builtin:spectral or a Basic Pitch model");
+        options.backend = backend;
     }
     if (options.tempo_bpm &&
         (!std::isfinite(*options.tempo_bpm) || *options.tempo_bpm < 40.0 ||
@@ -878,7 +901,8 @@ std::string key_name(const transcribe::ScoreMetadata& metadata) {
 }
 
 void write_json(const std::filesystem::path& path, const std::vector<transcribe::Note>& notes,
-                const transcribe::ScoreMetadata& metadata) {
+                const transcribe::ScoreMetadata& metadata,
+                const transcribe::ConfidenceReport& confidence) {
     std::ostringstream output;
     output << "{\n  \"metadata\": {\"tempo_bpm\": " << metadata.tempo_bpm
            << ", \"tempo_confidence\": " << metadata.tempo_confidence
@@ -891,7 +915,8 @@ void write_json(const std::filesystem::path& path, const std::vector<transcribe:
            << ", \"key\": \"" << json_escape(key_name(metadata))
            << "\", \"key_confidence\": " << metadata.key_confidence
            << ", \"key_inferred\": " << (metadata.key_inferred ? "true" : "false")
-           << "},\n  \"notes\": [\n";
+           << "},\n  \"legacy_note_confidence_semantics\":\"heuristic_not_probability\","
+              "\n  \"notes\": [\n";
     for (std::size_t index = 0; index < notes.size(); ++index) {
         const auto& note = notes[index];
         output << "    {\"midi\": " << note.midi_pitch << ", \"name\": \""
@@ -899,7 +924,8 @@ void write_json(const std::filesystem::path& path, const std::vector<transcribe:
                << ", \"duration\": " << note.duration_seconds << ", \"confidence\": "
                << note.confidence << "}" << (index + 1 == notes.size() ? "\n" : ",\n");
     }
-    output << "  ]\n}\n";
+    output << "  ],\n  \"confidence_report\":"
+           << transcribe::serialize_confidence_report(confidence) << "\n}\n";
     if (!output) {
         throw std::runtime_error("Failed while writing JSON output.");
     }
@@ -927,7 +953,9 @@ std::string engine_identifier(const Options& options) {
 void write_event_json(const std::filesystem::path& path,
                       const transcribe::ScoreDocument& score,
                       const std::filesystem::path& input,
-                      const Options& options) {
+                      const Options& options,
+                      const transcribe::PolyphonicTranscription* polyphonic = nullptr) {
+    const auto confidence_report = transcribe::score_confidence(score);
     std::ostringstream output;
     output << std::setprecision(12)
            << "{\n  \"format\":\"transcriber-note-events\",\n"
@@ -980,11 +1008,16 @@ void write_event_json(const std::filesystem::path& path,
         if (note.raw_evidence.empty() || !std::isfinite(note.interpretation_evidence))
             output << "null";
         else output << note.interpretation_evidence;
+        const auto& confidence = confidence_report.notes[i];
+        output << ",\"heuristic_score_semantics\":\"notation_interpretation_evidence\","
+                  "\"evidence_score\":";
+        if (confidence.evidence_score) output << *confidence.evidence_score;
+        else output << "null";
         output << ",\"calibrated_probability\":";
-        if (note.calibrated_confidence) output << *note.calibrated_confidence;
+        if (confidence.calibrated_probability) output << *confidence.calibrated_probability;
         else output << "null";
         output << ",\"semantics\":\""
-               << (note.calibrated_confidence ? "calibrated_probability" :
+               << (confidence.calibrated_probability ? "calibrated_probability" :
                    note.raw_evidence.empty() ? "unspecified" : "heuristic_score")
                << "\"},\"provenance\":{\"origin\":\"inference\",\"method\":\""
                << json_escape(engine_identifier(options)) << "\",\"source_event_ids\":[";
@@ -999,7 +1032,19 @@ void write_event_json(const std::filesystem::path& path,
         }
         output << "]}}";
     }
-    output << "\n  ]\n}\n";
+    output << "\n  ]";
+    if (polyphonic) {
+        output << ",\n  \"chords\":" << transcribe::serialize_identified_chords(polyphonic->chords)
+               << ",\n  \"polyphonic_diagnostics\":{\"discarded_short_notes\":"
+               << polyphonic->discarded_short_notes << ",\"refused_note_starts\":"
+               << polyphonic->refused_note_starts << '}';
+    }
+    output << ",\n  \"musical_analysis\":"
+           << transcribe::serialize_musical_analysis(transcribe::analyze_musical_structure(
+                  transcribe::to_score_interpretation(score).hypotheses.front()));
+    output << ",\n  \"confidence_report\":"
+           << transcribe::serialize_confidence_report(confidence_report);
+    output << "\n}\n";
     if (!output) throw std::runtime_error("Failed while writing versioned note-event JSON.");
     transcribe::write_output_atomic(path, output.str());
 }
@@ -1043,9 +1088,7 @@ void write_native_project(const std::filesystem::path& path,
         options.instrument == transcribe::InstrumentPrior::Piano ? "piano" :
         options.instrument == transcribe::InstrumentPrior::Voice ? "voice" : "auto";
     project.analysis.live_backend = options.backend.empty() ? "yin" : options.backend;
-    project.analysis.provider = options.onnx_provider == transcribe::OnnxExecutionProvider::Cpu ? "cpu" :
-        options.onnx_provider == transcribe::OnnxExecutionProvider::Cuda ? "cuda" :
-        options.onnx_provider == transcribe::OnnxExecutionProvider::DirectML ? "directml" : "rocm";
+    project.analysis.provider = transcribe::inference_provider_name(options.onnx_provider);
     project.analysis.tempo_automatic = !options.tempo_bpm;
     project.analysis.meter_automatic = !options.meter;
     project.analysis.key_automatic = !options.key_fifths;
@@ -1424,6 +1467,7 @@ std::size_t process_input(const std::filesystem::path& input_path, const Options
     };
     std::vector<transcribe::Note> notes;
     double audio_seconds = 0.0;
+    std::optional<transcribe::PolyphonicTranscription> polyphonic;
     double maximum_realtime_latency_ms = 0.0;
     transcribe::AnalysisTimings stage_timings;
     const auto accumulate_timings = [&stage_timings](
@@ -1455,6 +1499,13 @@ std::size_t process_input(const std::filesystem::path& input_path, const Options
                    });
     std::uint32_t source_sample_rate = extension == ".wav"
         ? transcribe::inspect_wav(analysis_path).sample_rate : 0;
+    if (options.tracked_polyphony && extension == ".wav") {
+        const auto info = transcribe::inspect_wav(analysis_path);
+        if (static_cast<double>(info.frames) / info.sample_rate >
+                transcribe::PolyphonicDecodingOptions{}.maximum_audio_seconds ||
+            info.frames > transcribe::PolyphonicDecodingOptions{}.maximum_audio_bytes / sizeof(float))
+            throw std::length_error("Tracked polyphonic recordings are limited to 120 seconds and 64 MiB decoded audio.");
+    }
     const bool streaming_wav = !options.live_pipeline && !options.asio && options.model.empty() &&
         options.backend.empty() && extension == ".wav";
     if (options.bounded_inference && (options.backend.empty() || options.asio ||
@@ -1576,6 +1627,13 @@ std::size_t process_input(const std::filesystem::path& input_path, const Options
                 transcribe::EngineConfiguration configuration;
                 configuration.audio_source_id = path_utf8(input_path);
                 configuration.inference = request;
+                if (options.tracked_polyphony) {
+                    configuration.polyphonic_decoding.emplace();
+                    configuration.polyphonic_decoding->activation_on = options.minimum_confidence;
+                    configuration.polyphonic_decoding->activation_off = options.minimum_confidence * .625;
+                    if (!options.model.empty())
+                        configuration.inference.analysis.instrument = transcribe::InstrumentPrior::None;
+                }
                 const auto configured = instance->configure(configuration);
                 if (const auto* failure = std::get_if<transcribe::InferenceError>(&configured))
                     throw std::runtime_error(failure->message);
@@ -1583,7 +1641,9 @@ std::size_t process_input(const std::filesystem::path& input_path, const Options
                 if (const auto* failure = std::get_if<transcribe::InferenceError>(&result)) {
                     throw std::runtime_error(failure->message);
                 }
-                notes = std::move(std::get<transcribe::EngineUpdate>(result).notes);
+                auto& update = std::get<transcribe::EngineUpdate>(result);
+                notes = std::move(update.notes);
+                polyphonic = std::move(update.polyphonic);
             }
         } else if (options.model.empty()) {
             transcribe::AnalysisOptions analysis_options;
@@ -1657,7 +1717,12 @@ std::size_t process_input(const std::filesystem::path& input_path, const Options
     case transcribe::InstrumentPrior::None:
         break;
     }
-    const auto interpretation = transcribe::interpret_notes(notes, interpretation_options);
+    const auto interpretation = polyphonic ?
+        transcribe::interpret_note_events(polyphonic->events, interpretation_options) :
+        transcribe::interpret_notes(notes, interpretation_options);
+    if (polyphonic && polyphonic->refused_note_starts)
+        std::cerr << "Polyphonic capacity: refused " << polyphonic->refused_note_starts
+                  << " note-start candidates; inspect --events-json diagnostics.\n";
     if (interpretation.hypotheses.empty()) {
         throw std::runtime_error("Musical interpretation produced no score hypothesis.");
     }
@@ -1697,13 +1762,15 @@ std::size_t process_input(const std::filesystem::path& input_path, const Options
     if (midi_path) {
         transcribe::write_midi(*midi_path, score);
     }
+    const auto confidence = transcribe::score_confidence(score);
     if (json_path) {
-        write_json(*json_path, notes, metadata);
+        write_json(*json_path, notes, metadata, confidence);
     }
     if (score_project_path) {
         write_score_project(*score_project_path, score);
     }
-    if (events_json_path) write_event_json(*events_json_path, score, input_path, options);
+    if (events_json_path) write_event_json(*events_json_path, score, input_path, options,
+        polyphonic ? &*polyphonic : nullptr);
     check_batch_cancel();
     if (project_path) write_native_project(*project_path, input_path, score, options);
 
@@ -1740,7 +1807,37 @@ std::size_t process_input(const std::filesystem::path& input_path, const Options
         } else {
             std::cout << "uncertain (C major default)";
         }
-        std::cout << '\n' << "  MusicXML: " << path_utf8(musicxml_path) << '\n'
+        const auto print_confidence = [](const transcribe::ConfidenceSummary& summary) {
+            std::cout << "evidence mean ";
+            if (summary.mean_evidence_score)
+                std::cout << std::fixed << std::setprecision(3) << *summary.mean_evidence_score;
+            else std::cout << "unavailable";
+            std::cout << " (heuristic); calibrated mean ";
+            if (summary.mean_calibrated_probability) std::cout << *summary.mean_calibrated_probability;
+            else std::cout << "unavailable";
+            std::cout << "; assessed " << summary.assessed_notes << '/' << summary.note_count
+                      << "; low " << summary.low_notes << '\n';
+        };
+        std::cout << "\n  Confidence: ";
+        print_confidence(confidence.transcription);
+        if (options.confidence_details) {
+            for (std::size_t i = 0; i < confidence.phrases.size(); ++i) {
+                const auto& phrase = confidence.phrases[i];
+                std::cout << "  Phrase " << i + 1 << " [" << phrase.start_seconds << ", "
+                          << phrase.end_seconds << " s]: ";
+                print_confidence(phrase.summary);
+            }
+            for (const auto& note : confidence.notes) {
+                std::cout << "  Note " << note.note_id << ": " << note.band << "; evidence ";
+                if (note.evidence_score) std::cout << *note.evidence_score;
+                else std::cout << "unavailable";
+                std::cout << "; calibrated ";
+                if (note.calibrated_probability) std::cout << *note.calibrated_probability;
+                else std::cout << "unavailable";
+                std::cout << '\n';
+            }
+        }
+        std::cout << "  MusicXML: " << path_utf8(musicxml_path) << '\n'
                   << "  Guitar tab: " << path_utf8(tab_path) << '\n';
         if (midi_path) {
             std::cout << "  MIDI: " << path_utf8(*midi_path) << '\n';
@@ -1943,6 +2040,7 @@ std::string journal_key(const BatchJob& job) {
              << ':' << (job.options.backend) << ':' << path_utf8(job.options.model)
              << ':' << job.options.polyphonic << ':' << job.options.fast_preview
              << ':' << job.options.competing_polyphony
+             << ':' << job.options.tracked_polyphony
              << ':' << job.options.minimum_confidence << ':' << job.options.tempo_bpm.value_or(0)
              << ':' << static_cast<int>(job.options.instrument) << ':'
              << static_cast<int>(job.options.onnx_provider) << ':'

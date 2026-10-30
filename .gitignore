@@ -2,6 +2,7 @@
 /build-tests/
 /build-*/
 /cmake-build-*/
+/out/build/
 *.obj
 *.exe
 *.dll

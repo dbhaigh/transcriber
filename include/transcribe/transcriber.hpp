@@ -152,7 +152,8 @@ enum class OnnxExecutionProvider {
     Cpu,
     Cuda,
     DirectML,
-    Rocm
+    Rocm,
+    TensorRT
 };
 
 enum class PitchObjective { Unspecified, Monophonic, IndependentMultiPitch };

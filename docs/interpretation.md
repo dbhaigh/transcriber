@@ -23,7 +23,75 @@ ambiguity flags and alternatives instead of presenting heuristic confidence as
 a probability of correctness. Tempo, meter, key, pickup, instrument name and
 written transposition can be constrained through `InterpretationOptions`.
 
-### Quantization policies
+## Harmonic and scale analysis
+
+[`musical_analysis.hpp`](../include/transcribe/musical_analysis.hpp) adds
+`analyze_musical_structure(const ScoreHypothesis&)` above the existing key,
+tempo and meter inference. It is detector-independent: monophonic, spectral
+and neural events all enter through the same interpretation contracts.
+
+- **Key signatures:** duration-weighted major/minor pitch profiles retain
+  competing keys and ambiguity. Alternative confidence cannot exceed the
+  winning candidate merely because it fits worse.
+- **Chords:** an onset/offset sweep analyzes half-open sounding intervals,
+  including held bass notes under later attacks. It reuses the polyphonic
+  decoder's pitch-class templates rather than maintaining another chord
+  dictionary. Each interval retains current-score note indices, root, quality,
+  bass/inversion and diatonic status. Unknown sets remain unknown.
+- **Scales:** duration-weighted pitch-class histograms report coverage for
+  the selected key's major or natural-minor scale and the three best alternative
+  readings from major, natural/harmonic/melodic minor and the other diatonic
+  modes, over all 12 tonics. Coverage is membership support, **not probability**.
+  Relative keys and modal rotations can tie; alternatives do not replace the
+  chosen key.
+- **Consistency checks:** `chromatic-note` and `minor-raised-degree` refer to
+  current-score note indices. The latter recognizes the usual raised sixth
+  and seventh of minor. Checks use confident local tonal regions, including
+  pickups, unless the user constrained the key. Nondiatonic chords are retained:
+  passing tones, borrowed harmony and modulation are not detector mistakes.
+- **Meter:** measured RMS, or MIDI velocity when RMS is unavailable, supplies
+  a separate accent signal. With at least eight accented attacks and RMS/velocity
+  variance >= 0.0025, meter ranking combines timing support (35%) with normalized
+  accent correlation (65%). Constant or absent dynamics retain timing-only
+  behavior; detector confidence is not used as loudness. Ambiguity and explicit
+  meter overrides remain authoritative.
+- **Tempo:** the existing interval/subdivision and local-tempo estimator is
+  retained. A numerical tolerance at the 180 BPM normalization boundary prevents
+  floating-point rounding from accidentally halving that tempo.
+
+The analysis is **derived**, never a pitch correction pass. It does not delete
+chromatic notes, change confidence, or rewrite sample positions. Recompute it
+from the current hypothesis after editing. Canonical project serialization and
+integrity checksums are unchanged, so old projects still open; analysis is
+regenerated rather than persisted as a potentially stale source of truth.
+The CLI's `--events-json` adds `musical_analysis`, and workstation metadata
+messages include the same analysis. `serialize_musical_analysis` is available
+to library consumers. Note indices refer to the current hypothesis/score note
+order; those notes retain their original source-event links.
+
+### MusicXML harmony
+
+The interpretation-aware and canonical-score exports automatically emit
+`<harmony>` elements for exact-template sonorities with at least three distinct
+pitch classes lasting at least **0.25 quarter notes**. Rotationally symmetric
+augmented and diminished-seventh sets are not automatically named. Dyads,
+short fragments and unknown sets are retained in analysis but not exported as
+confident chord symbols. This is a conservative notation gate, **not calibrated
+chord confidence**. Adjacent repetitions of the same root/quality/bass produce
+one symbol; gaps and changed basses start a new symbol.
+
+Symbols use written transposition, key-aware root/bass spelling, inversion and
+measure-relative offsets. They appear on the notation staff, not twice on the
+tab staff, and do not advance the rhythmic cursor or change note voices,
+durations, ties or accidentals. Existing uncertainty handling for key, meter
+and tempo still controls whether those structural attributes are asserted.
+The legacy `vector<Note>` MusicXML overloads remain unchanged.
+
+Scale checks use sounding pitch. As in the existing notation API, an explicit
+key constraint is a written-key constraint; analysis converts its tonic back
+to sounding pitch for a transposing instrument.
+
+## Quantization policies
 
 The default `QuantizationMode::Legacy` retains the existing independent onset
 snapper and duration matcher. The new policies are opt-in; no detector threshold
@@ -223,6 +291,72 @@ controls lock while busy, invalid strength is rejected before submission and
 no page errors occur. UI source smoke passed; Node's standalone syntax check
 was unavailable, and existing aggregate-initializer/compiler warnings remain.
 No ASIO hardware or acoustic dataset is involved in these notation tests.
+
+## Musical-analysis metrics
+
+The additional C++ evaluation runner
+[`musical_analysis_evaluation.cpp`](../tests/musical_analysis_evaluation.cpp)
+generates the original `musical-cadences-v1` symbolic corpus: 24 major/minor
+I-IV-V-I / i-iv-v-i passages over all 12 tonics, 3/4 and 4/4, and 60, 90, 120
+and 180 BPM. They contain 2,016 source events with measured times, sample
+positions, RMS accents, confidence and raw evidence. No key, tempo or meter
+override is supplied. Local-key and tempo-change inference are disabled to
+isolate the global estimators on these constant-context passages.
+
+The retained result is
+[`musical-interpretation-synthetic.json`](../python/evaluation/musical-interpretation-synthetic.json).
+On the Windows Release build:
+
+- Key accuracy (enharmonic tonic plus major/minor): **24/24**.
+- Tempo within 4% of reference: **24/24**; mean relative error below `1e-12`.
+- Exact numerator/denominator top-ranked meter: **24/24**, but **all 24
+  retain the meter-ambiguity flag**. This is not confident meter recognition:
+  metric aliases remain close, and export should not assert the meter without
+  more evidence or a user override.
+- Duration-weighted chord root-and-quality accuracy in recording seconds:
+  **1.0**. Reference and predicted score coordinates are independently mapped
+  to seconds so a tempo error cannot masquerade as a chord-label error.
+- Mean duration-weighted selected-scale membership: **1.0**.
+- Source evidence preservation: **2,016/2,016**. This checks identity, pitch,
+  measured times/samples, sample rate, lifecycle, model, intensity, confidence
+  and raw strength/onset evidence.
+
+CTest gates exact key/meter/tempo fixture recognition, chord accuracy >= 0.99
+and complete source preservation. The separate unit tests cover chromatic
+tones, harmonic-minor alternatives, local keys, unknown/short/symmetric sets,
+rejected events, manual edits, project round trips, written transposition,
+XML chord vocabulary, offsets and repeated-symbol suppression. Existing
+annotated notation semantics and CLI export tests are retained.
+
+Each derived analysis also exposes application-level diagnostics: note count,
+out-of-scale count, union sounding duration, named-chord duration/coverage,
+symbolic-rhythm fraction and mean absolute onset/offset notation residuals in
+seconds. These are review metrics, not ground-truth accuracy scores: a
+chromatic passage can legitimately have low scale membership.
+
+Reproduce with an existing tests-enabled build:
+
+```powershell
+cmake --build build --target transcriber-tests transcriber-musical-evaluate
+.\build\transcriber-tests.exe "[musical-analysis],[interpretation],[score],[project]"
+.\build\transcriber-musical-evaluate.exe musical-interpretation.json
+ctest --test-dir build -R "musical_interpretation_evaluation|interpretation_semantics|polyphonic_cli|cli_export_validation" --output-on-failure
+```
+
+These are deterministic **symbolic semantic tests**, not real-audio harmonic
+accuracy or evidence of improved pitch detection. In particular, exact
+pitch-class templates still miss omitted/extra chord tones and cannot resolve
+all relative/symmetric harmonic interpretations. The earlier real-recording
+note/chord limits in [polyphonic-pipeline.md](polyphonic-pipeline.md) still
+apply; this change does not establish a new real-recording chord accuracy
+claim.
+
+Validation of this extension on Windows Release: **75 selected C++ cases,
+704 assertions passed**, **7/7 selected CTests passed** (including direct and
+canonical-round-trip notation semantics, DSP/ONNX CLI exports and the new
+evaluation). The native MSVC workstation rebuilt and passed its actual
+WebView2 polyphonic note/harmony/export workflow. Existing compiler warnings
+were not suppressed or changed.
 
 ## Current limits
 

@@ -134,6 +134,25 @@ guaranteed playable in the complete phrase; `candidates` describes the retained
 sequence-supported choices. A bounded unresolved result is not proof that
 no playable fingering exists.
 
+## Benchmark
+
+`transcriber-fingering-benchmark` measures the solver on deterministic
+standard-tuning scales, a wide-stretch chord shape, chord progressions, and a
+seven-string alternate tuning with capo. Its JSON report includes p50/p95 solve time, notes per second,
+candidate-position count, retained alternatives, visited search nodes,
+truncation/completeness status, and the selected cost breakdown. A warm-up run
+is excluded from timing. Use the same build configuration and machine when
+comparing reports; timings are informational and are not a CI pass/fail gate.
+
+```powershell
+cmake --build build --target transcriber-fingering-benchmark
+.\build\transcriber-fingering-benchmark.exe --repetitions 7 --output fingering-benchmark.json
+```
+
+CTest runs the smaller deterministic workload with `--smoke`. It validates
+that every generated note and returned alternative is playable and pitch
+preserving; it does not assert machine-dependent latency.
+
 Use the existing wrapper without replacing its legacy top-level settings:
 
 ```cpp

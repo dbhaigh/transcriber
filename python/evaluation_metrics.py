@@ -146,6 +146,18 @@ def validate_events(events: list[dict[str, Any]]) -> None:
             raise ValueError(f"Invalid event timing: {event!r}")
 
 
+def _offset_matches(
+    reference: dict[str, Any],
+    prediction: dict[str, Any],
+    tolerances: Tolerances,
+) -> bool:
+    reference_end = reference["start"] + reference["duration"]
+    prediction_end = prediction["start"] + prediction["duration"]
+    tolerance = max(tolerances.offset_seconds,
+                    tolerances.offset_ratio * reference["duration"])
+    return abs(prediction_end - reference_end) <= tolerance + 1e-12
+
+
 def event_pairs(
     references: list[dict[str, Any]],
     predictions: list[dict[str, Any]],
@@ -174,9 +186,7 @@ def event_pairs(
                          - reference["start"] - reference["duration"])
             if require_onset and onset > tolerances.onset_seconds + 1e-12:
                 continue
-            if require_offset and offset > max(
-                tolerances.offset_seconds, tolerances.offset_ratio * reference["duration"]
-            ) + 1e-12:
+            if require_offset and not _offset_matches(reference, prediction, tolerances):
                 continue
             if require_overlap and max(prediction["start"], reference["start"]) >= min(
                 prediction["start"] + prediction["duration"],
@@ -288,6 +298,12 @@ def score_events(references, predictions, duration: float,
     timing = event_pairs(references, predictions, require_pitch=False, tolerances=tolerances)
     pitch = event_pairs(references, predictions, require_onset=False, require_overlap=True,
                         tolerances=tolerances)
+    frame = checked_metrics(*frame_counts(references, predictions, duration,
+                                          tolerances.frame_seconds))
+    offset_correct = sum(
+        _offset_matches(references[reference], predictions[prediction], tolerances)
+        for reference, prediction in onset
+    )
     # Pitch-independent timing matches avoid making pitch accuracy tautologically 100%.
     correct_pitch = sum(references[r]["midi"] == predictions[p]["midi"] for r, p in timing)
     chord_indices = {
@@ -344,8 +360,18 @@ def score_events(references, predictions, duration: float,
                                        len(references) - len(onset)),
         "pitch_event": checked_metrics(len(pitch), len(predictions) - len(pitch),
                                        len(references) - len(pitch)),
-        "frame": checked_metrics(*frame_counts(references, predictions, duration,
-                                               tolerances.frame_seconds)),
+        "frame": frame,
+        "onset_accuracy": {
+            "correct": len(onset),
+            "reference": len(references),
+            "value": len(onset) / len(references) if references else None,
+        },
+        "offset_accuracy": {
+            "correct": offset_correct,
+            "onset_matches": len(onset),
+            "value": offset_correct / len(onset) if onset else None,
+        },
+        "polyphonic_accuracy": frame["f1"],
         "pitch_accuracy": {"correct": correct_pitch, "matched": len(timing),
                            "value": correct_pitch / len(timing) if timing else None},
         "chord_note_recall": {"correct": chord_hits, "reference": len(chord_indices),

@@ -62,6 +62,11 @@ and redo retain intact before/after snapshots, including tuning, tabs, rests,
 source evidence and musical context, and publish a new monotonic revision.
 Moving a snapshot's document out during restoration previously broke later
 undo/redo cycles; snapshots are now reusable.
+Accepted/rejected notes and pitch, timing, split, merge, insert and delete
+operations are retained in the canonical correction journal with linked
+source-event IDs and before/after note state. Undo deactivates the affected
+correction records and redo reactivates them; measured detector evidence stays
+unchanged.
 
 The WebView history deep-copies pending musical/tab/context/review state,
 selection and live-deletion tombstones. Pitch/time/fingering validation is

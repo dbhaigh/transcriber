@@ -68,6 +68,8 @@
   let reviewByNote = new Map();
   let prioritizedReviewNotes = [];
   let reviewDecisions = [];
+  let scoreActions = [];
+  let nextScoreActionSequence = 1;
   let dismissedReviewSuggestions = new Set();
   const contextControlIds = [
     "tempo-control", "tempo-auto", "key-control", "minor-control", "meter-control",
@@ -739,6 +741,15 @@
     drawAudioAxes(frame, true);
   }
 
+  function calibratedConfidence(note) {
+    if (note.user_authored) return null;
+    if (note.confidence_assessment) {
+      const value = note.confidence_assessment.calibrated_probability;
+      return Number.isFinite(value) ? value : null;
+    }
+    return Number.isFinite(note.calibrated_confidence) ? note.calibrated_confidence : null;
+  }
+
   function drawConfidence() {
     const frame = fitCanvas($("confidence-heatmap"));
     if (!frame) return;
@@ -750,15 +761,24 @@
     visibleEntries.forEach(({ note }) => {
       const x = timeline.x(note.start, totalDuration(), width);
       const w = Math.max(2, timeline.x(note.start + note.duration, totalDuration(), width) - x);
-      if (!Number.isFinite(note.calibrated_confidence)) {
+      const calibrated = calibratedConfidence(note);
+      const evidence = note.user_authored ? null : note.confidence_assessment?.evidence_score;
+      const score = Number.isFinite(calibrated) ? calibrated : evidence;
+      if (!Number.isFinite(score)) {
         context.fillStyle = "rgba(120, 137, 145, .38)";
         context.fillRect(x, height * .25, w, height * .5);
         return;
       }
-      const value = Math.max(0, Math.min(1, note.calibrated_confidence));
+      const value = Math.max(0, Math.min(1, score));
       const hue = 4 + value * 150;
       context.fillStyle = `hsla(${hue}, 68%, 58%, ${.35 + value * .65})`;
       context.fillRect(x, height * .25, w, height * .5);
+      if (!Number.isFinite(calibrated)) {
+        context.strokeStyle = canvasColor("--text", "#ecf2f4");
+        context.setLineDash([2, 3]);
+        context.strokeRect(x, height * .25, w, height * .5);
+        context.setLineDash([]);
+      }
     });
   }
 
@@ -813,9 +833,22 @@
       pendingLiveDeletes: [...pendingLiveDeletes],
       settings,
       reviewDecisions,
+      scoreActions,
       dismissedReviewSuggestions: [...dismissedReviewSuggestions],
     }));
     if (target.length > 100) target.shift();
+  }
+
+  function recordScoreAction(action) {
+    scoreActions.push({ ...action, sequence: nextScoreActionSequence++ });
+  }
+
+  function clearCommittedScoreActions(sequence = Number.MAX_SAFE_INTEGER) {
+    scoreActions = scoreActions.filter((action) => action.sequence > sequence);
+    for (const snapshot of [...history, ...redoHistory]) {
+      snapshot.scoreActions = (snapshot.scoreActions || [])
+        .filter((action) => action.sequence > sequence);
+    }
   }
 
   function updateHistoryButtons() {
@@ -824,7 +857,7 @@
     $("redo-button").disabled = locked || redoHistory.length === 0;
   }
 
-  function markEdited(restoring = false) {
+  function markEdited(restoring = false, semanticAction = null) {
     noteIndexDirty = true;
     const assigned = new Map();
     let error = "";
@@ -866,17 +899,65 @@
     const current = new Map(notes.filter((note) => note.id)
       .map((note) => [note.id, note]));
     const changes = [];
+    const semanticIds = new Set([
+      semanticAction?.note_id,
+      semanticAction?.second_note_id,
+      semanticAction?.first_note_id,
+      semanticAction?.merged_note_id,
+    ].filter(Boolean));
+    if (!restoring && semanticAction) recordScoreAction(semanticAction);
     editBaselineNotes.forEach((previous, id) => {
-      if (!current.has(id)) changes.push({ kind: "delete", note_id: id });
+      if (!current.has(id)) {
+        if (!restoring && !semanticIds.has(id)) {
+          recordScoreAction({ kind: "reject", note_id: id });
+        }
+        changes.push({ kind: "delete", note_id: id });
+      }
     });
     current.forEach((note, id) => {
       const previous = editBaselineNotes.get(id);
-      if (!previous || previous.midi !== note.midi ||
-          Math.abs(previous.start - note.start) > .0001 ||
-          Math.abs(previous.duration - note.duration) > .0001) {
+      const pitchChanged = Boolean(previous && previous.midi !== note.midi);
+      const startQuarters = quartersAt(note.start);
+      const durationQuarters =
+        quartersAt(note.start + note.duration) - startQuarters;
+      const timingChanged = Boolean(previous &&
+        (Math.abs(previous.start - note.start) > .0001 ||
+          Math.abs(previous.duration - note.duration) > .0001));
+      const noteChanged = !previous || pitchChanged || timingChanged;
+      if (noteChanged) {
         if (!restoring) {
-          note.user_authored = true;
-          note.state = "manually_corrected";
+          if (pitchChanged || timingChanged) {
+            note.user_authored = true;
+            note.state = "manually_corrected";
+            invalidateConfidence(note);
+          }
+          if (!semanticIds.has(id)) {
+            if (!previous) {
+              recordScoreAction({
+                kind: "insert", note_id: id, midi: note.midi,
+                onset_quarters: startQuarters,
+                duration_quarters: durationQuarters,
+              });
+            } else {
+              if (pitchChanged) {
+                recordScoreAction({ kind: "pitch", note_id: id, midi: note.midi });
+              }
+              const onsetChanged = Math.abs(
+                (previous.onset_quarters ?? quartersAt(previous.start)) -
+                  startQuarters) > 1e-5;
+              const durationChanged = Math.abs(
+                (previous.duration_quarters ??
+                  quartersAt(previous.start + previous.duration) -
+                    quartersAt(previous.start)) - durationQuarters) > 1e-5;
+              if (onsetChanged || durationChanged) {
+                recordScoreAction({
+                  kind: "timing", note_id: id,
+                  onset_quarters: startQuarters,
+                  duration_quarters: durationQuarters,
+                });
+              }
+            }
+          }
         }
         changes.push({
           kind: previous || !id.startsWith("user-") ? "update" : "add",
@@ -904,8 +985,17 @@
         changes.push({ kind: "fingering", note_id: id, string: 0, fret: -1 });
       }
     });
-    editBaselineNotes = new Map([...current].map(([id, note]) =>
-      [id, { midi: note.midi, start: note.start, duration: note.duration }]));
+    editBaselineNotes = new Map([...current].map(([id, note]) => {
+      const onset_quarters = quartersAt(note.start);
+      return [id, {
+        midi: note.midi,
+        start: note.start,
+        duration: note.duration,
+        onset_quarters,
+        duration_quarters:
+          quartersAt(note.start + note.duration) - onset_quarters,
+      }];
+    }));
     editBaselineFingerings = currentFingerings;
     window.dispatchEvent(new CustomEvent("transcribe:edited", {
       detail: { notes, changes, dirty: true },
@@ -975,6 +1065,8 @@
     fields.forEach((id) => { $(id).disabled = !note || editDisabled; });
     $("apply-note-edit").disabled = !note || editDisabled;
     $("delete-note").disabled = !note || editDisabled;
+    $("accept-note").disabled = !note || editDisabled || note.user_accepted;
+    $("accept-note").textContent = note?.user_accepted ? "Accepted" : "Accept note";
     $("split-note").disabled = !note || editDisabled || note.duration < .1;
     $("merge-note").disabled = !note || editDisabled;
     if (!note) {
@@ -1027,9 +1119,12 @@
       ? `${note.measured_start.toFixed(3)} s` : "Not measured";
     $("detected-offset").textContent = Number.isFinite(note.measured_end)
       ? `${note.measured_end.toFixed(3)} s` : "Not measured";
-    $("detected-confidence").textContent = Number.isFinite(note.calibrated_confidence)
-      ? `${Math.round(Math.max(0, Math.min(1, note.calibrated_confidence)) * 100)}%`
-      : "Not provided";
+    const assessment = note.confidence_assessment;
+    const calibrated = calibratedConfidence(note);
+    $("detected-confidence").textContent = Number.isFinite(calibrated)
+      ? `${Math.round(Math.max(0, Math.min(1, calibrated)) * 100)}% calibrated`
+      : Number.isFinite(assessment?.evidence_score) && !note.user_authored
+        ? `Evidence ${assessment.evidence_score.toFixed(2)} (heuristic)` : "Unassessed";
     const evidence = Array.isArray(note.raw_evidence) ? note.raw_evidence : [];
     const evidenceCount = Number.isInteger(note.raw_evidence_count)
       ? note.raw_evidence_count : evidence.length;
@@ -1043,9 +1138,11 @@
       : Number.isFinite(note.raw_strength)
         ? `Raw backend strength ${note.raw_strength.toFixed(3)} · not a probability`
         : "No raw evidence";
-    $("edit-instructions").textContent = Number.isFinite(note.calibrated_confidence)
-      ? `Calibrated correctness estimate ${Math.round(note.calibrated_confidence * 100)}%`
+    $("edit-instructions").textContent = Number.isFinite(calibrated)
+      ? `Calibrated correctness estimate ${Math.round(calibrated * 100)}%`
       : "No calibrated correctness estimate is available";
+    if (assessment?.reasons?.length)
+      $("edit-instructions").textContent += ` · ${assessment.reasons.join("; ").replaceAll("-", " ")}`;
     if (note.guitar_technique) {
       $("edit-instructions").textContent +=
         ` · Guitar contour: ${note.guitar_technique.gesture}. ${note.guitar_technique.explanation}` +
@@ -1407,6 +1504,7 @@
       note.duration = scoreSplit - note.start;
       note.user_authored = true;
       note.state = "manually_corrected";
+      invalidateConfidence(note);
       notes.splice(index + 1, 0, second);
       tabPositions.splice(index + 1, 0, computeTabPosition(second, index + 1));
     } else {
@@ -1597,20 +1695,35 @@
     updateHistoryButtons();
   }
 
+  function acceptSelected() {
+    if (transcriptionBusy && !liveCaptureActive) return;
+    if (selectedIndex < 0 || selectedIndex >= notes.length) return;
+    const note = notes[selectedIndex];
+    if (note.user_accepted) return;
+    saveSnapshot();
+    redoHistory = [];
+    note.user_accepted = true;
+    markEdited(false, { kind: "accept", note_id: note.id });
+    renderSelected();
+    drawAll();
+    updateHistoryButtons();
+  }
+
   function removeSelected() {
     if (transcriptionBusy && !liveCaptureActive) return;
     if (selectedIndex < 0 || selectedIndex >= notes.length) return;
     saveSnapshot();
     redoHistory = [];
-    if (liveCaptureActive && notes[selectedIndex].id) {
-      pendingLiveDeletes.add(notes[selectedIndex].id);
+    const rejectedId = notes[selectedIndex].id;
+    if (liveCaptureActive && rejectedId) {
+      pendingLiveDeletes.add(rejectedId);
     }
     notes.splice(selectedIndex, 1);
     tabPositions.splice(selectedIndex, 1);
     selectedIndex = -1;
     renderSelected();
     drawAll();
-    markEdited();
+    markEdited(false, { kind: "reject", note_id: rejectedId });
     updateHistoryButtons();
   }
 
@@ -1676,6 +1789,8 @@
     pendingLiveDeletes = new Set(snapshot.pendingLiveDeletes || []);
     reviewDecisions = (snapshot.reviewDecisions || [])
       .map((decision) => ({ ...decision }));
+    scoreActions = (snapshot.scoreActions || [])
+      .map((action) => ({ ...action }));
     dismissedReviewSuggestions = new Set(
       snapshot.dismissedReviewSuggestions || []);
     if (snapshot.settings) {
@@ -1716,6 +1831,15 @@
     updateHistoryButtons();
   }
 
+  function invalidateConfidence(note) {
+    note.calibrated_confidence = null;
+    note.confidence = null;
+    note.confidence_assessment = {
+      note_id: note.id, band: "user-edited", evidence_score: null, calibrated_probability: null,
+      reasons: ["detector-confidence-does-not-assess-user-edits"],
+    };
+  }
+
   function acceptNotes(nextNotes) {
     if (!Array.isArray(nextNotes)) return;
     const oldCount = notes.length;
@@ -1741,6 +1865,7 @@
         note.duration = prior.duration;
         note.user_authored = true;
         note.state = "manually_corrected";
+        invalidateConfidence(note);
       }
       return note;
     });
@@ -1770,8 +1895,17 @@
       history = [];
       redoHistory = [];
     }
-    editBaselineNotes = new Map(notes.filter((note) => note.id).map((note) =>
-      [note.id, { midi: note.midi, start: note.start, duration: note.duration }]));
+    editBaselineNotes = new Map(notes.filter((note) => note.id).map((note) => {
+      const onset_quarters = quartersAt(note.start);
+      return [note.id, {
+        midi: note.midi,
+        start: note.start,
+        duration: note.duration,
+        onset_quarters,
+        duration_quarters:
+          quartersAt(note.start + note.duration) - onset_quarters,
+      }];
+    }));
     editBaselineFingerings = new Map(notes.flatMap((note, index) => {
       const position = tabPositions[index];
       return note.id && position?.manual && position.string > 0 &&
@@ -1824,7 +1958,25 @@
   function acceptMetadata(metadata) {
     stopPlayback();
     currentMetadata = metadata || {};
-    if (currentMetadata.score_id) scoreId = currentMetadata.score_id;
+    const nextScoreId = String(currentMetadata.score_id || "");
+    if (nextScoreId && nextScoreId !== scoreId) {
+      scoreActions = [];
+      reviewDecisions = [];
+      history = [];
+      redoHistory = [];
+      editBaselineNotes = new Map(notes.filter((note) => note.id).map((note) => {
+        const onset_quarters = quartersAt(note.start);
+        return [note.id, {
+          midi: note.midi,
+          start: note.start,
+          duration: note.duration,
+          onset_quarters,
+          duration_quarters:
+            quartersAt(note.start + note.duration) - onset_quarters,
+        }];
+      }));
+    }
+    if (nextScoreId) scoreId = nextScoreId;
     if (Number.isInteger(currentMetadata.score_revision)) {
       scoreRevision = currentMetadata.score_revision;
     }
@@ -2097,6 +2249,38 @@
     send("export-edits", scoreWriteFields());
   }
 
+  function serializeScoreAction(action) {
+    switch (action.kind) {
+      case "accept":
+      case "reject":
+        return [action.kind, action.note_id].join(",");
+      case "pitch":
+        return [action.kind, action.note_id, action.midi].join(",");
+      case "timing":
+        return [
+          action.kind, action.note_id,
+          action.onset_quarters, action.duration_quarters,
+        ].join(",");
+      case "insert":
+        return [
+          action.kind, action.note_id, action.midi,
+          action.onset_quarters, action.duration_quarters,
+        ].join(",");
+      case "split":
+        return [
+          action.kind, action.note_id, action.second_note_id,
+          action.first_duration_quarters,
+        ].join(",");
+      case "merge":
+        return [
+          action.kind, action.first_note_id, action.second_note_id,
+          action.merged_note_id,
+        ].join(",");
+      default:
+        throw new Error(`Unsupported score correction action: ${action.kind}`);
+    }
+  }
+
   function scoreWriteFields(extra = {}) {
     const notesPayload = notes.map((note) => [
       note.id, note.midi, note.start, note.duration,
@@ -2124,6 +2308,8 @@
       written_transposition: $("written-transposition-control").value,
       base_revision: String(scoreRevision),
       score_id: scoreId,
+      score_actions: scoreActions.map(serializeScoreAction).join(";"),
+      score_action_sequence: String(scoreActions.at(-1)?.sequence || 0),
       review_decisions: reviewDecisions.map((decision) =>
         [decision.id, decision.note_id, decision.outcome].join(",")).join(";"),
       tuning: $("guitar-tuning").value,
@@ -2164,18 +2350,26 @@
     if (row) chooseNote(Number(row.dataset.index));
   });
   $("apply-note-edit").addEventListener("click", applySelectedEdit);
+  $("accept-note").addEventListener("click", acceptSelected);
   $("delete-note").addEventListener("click", removeSelected);
   $("split-note").addEventListener("click", () => {
     const note = notes[selectedIndex];
     if (!note || note.duration < .1 || (transcriptionBusy && !liveCaptureActive)) return;
     saveSnapshot();
     const half = note.duration / 2;
+    const splitSeconds = note.start + half;
     const continuation = { ...note, id: `user-${scoreId || "score"}-${nextUserNoteId++}`,
       start: note.start + half, duration: half, user_authored: true };
     note.duration = half;
     notes.splice(selectedIndex + 1, 0, continuation);
     tabPositions.splice(selectedIndex + 1, 0, { ...tabPositions[selectedIndex] });
-    markEdited();
+    markEdited(false, {
+      kind: "split",
+      note_id: note.id,
+      second_note_id: continuation.id,
+      first_duration_quarters:
+        quartersAt(splitSeconds) - quartersAt(note.start),
+    });
     renderSelected();
     drawAll();
     updateHistoryButtons();
@@ -2184,19 +2378,26 @@
     const note = notes[selectedIndex];
     if (!note || (transcriptionBusy && !liveCaptureActive)) return;
     const next = notes.reduce((candidate, item, index) =>
-      item.midi === note.midi && item.start >= note.start + note.duration - 1e-6 &&
+      item.midi === note.midi && item.voice === note.voice &&
+      item.start >= note.start + note.duration - 1e-6 &&
       (candidate < 0 || item.start < notes[candidate].start) ? index : candidate, -1);
     if (next < 0) {
       $("edit-instructions").textContent = "No following same-pitch note is available to merge.";
       return;
     }
     saveSnapshot();
+    const secondNoteId = notes[next].id;
     note.duration = notes[next].start + notes[next].duration - note.start;
-    if (liveCaptureActive) pendingLiveDeletes.add(notes[next].id);
+    if (liveCaptureActive) pendingLiveDeletes.add(secondNoteId);
     notes.splice(next, 1);
     tabPositions.splice(next, 1);
     selectedIndex = notes.indexOf(note);
-    markEdited();
+    markEdited(false, {
+      kind: "merge",
+      first_note_id: note.id,
+      second_note_id: secondNoteId,
+      merged_note_id: note.id,
+    });
     renderSelected();
     drawAll();
     updateHistoryButtons();
@@ -2395,6 +2596,12 @@
       scoreRevision = revision;
       if (currentMetadata) currentMetadata.score_revision = revision;
     }
+    const committedActionSequence =
+      Number(event.detail?.score_action_sequence);
+    if (Number.isSafeInteger(committedActionSequence) &&
+        committedActionSequence >= 0) {
+      clearCommittedScoreActions(committedActionSequence);
+    }
     currentProjectSettings = {
       ...(currentProjectSettings || {}),
       tempo_automatic: $("tempo-auto").checked,
@@ -2512,6 +2719,8 @@
     if (message.success && Number.isInteger(message.score_revision)) {
       scoreRevision = message.score_revision;
       reviewDecisions = [];
+      clearCommittedScoreActions();
+      edited = false;
       updateHistoryButtons();
     }
     contextBeforeLastChange = readScoreContext();

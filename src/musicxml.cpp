@@ -1,5 +1,7 @@
 #include "transcribe/musicxml.hpp"
+#include "transcribe/confidence.hpp"
 #include "transcribe/output.hpp"
+#include "transcribe/musical_analysis.hpp"
 
 #include <algorithm>
 #include <array>
@@ -797,7 +799,8 @@ std::string render_musicxml(const ScoreInterpretation& interpretation,
                             const GuitarTabOptions& tab_options,
                             bool preserve_expressive_timing,
                             const std::vector<std::string>* score_note_ids,
-                            const std::vector<GuitarTabPosition>* canonical_positions = nullptr) {
+                            const std::vector<GuitarTabPosition>* canonical_positions = nullptr,
+                            const ConfidenceReport* supplied_confidence = nullptr) {
     if (hypothesis_index >= interpretation.hypotheses.size()) {
         throw std::out_of_range("MusicXML hypothesis index is out of range.");
     }
@@ -1194,14 +1197,34 @@ std::string render_musicxml(const ScoreInterpretation& interpretation,
             state->second = token->spelling_alter;
         }
     }
+    const auto musical_analysis = analyze_musical_structure(hypothesis);
+    std::vector<const HarmonicInterval*> harmony_symbols;
+    const HarmonicInterval* previous_harmony = nullptr;
+    for (const auto& harmony : musical_analysis.harmony) {
+        const bool continuation = previous_harmony && previous_harmony->export_symbol &&
+            previous_harmony->offset_quarters == harmony.onset_quarters &&
+            previous_harmony->chord.root_pitch_class == harmony.chord.root_pitch_class &&
+            previous_harmony->chord.quality == harmony.chord.quality &&
+            previous_harmony->chord.bass_midi_pitch % 12 == harmony.chord.bass_midi_pitch % 12;
+        if (harmony.export_symbol && !continuation) harmony_symbols.push_back(&harmony);
+        previous_harmony = &harmony;
+    }
     const std::string part_name = xml_escape(
         hypothesis.instrument.empty() ? "Transcription" : hypothesis.instrument);
+    const auto derived_confidence = supplied_confidence ? ConfidenceReport{} :
+        score_confidence(make_score_document(interpretation, hypothesis_index, "musicxml",
+            metadata_for_hypothesis(hypothesis), tab_options));
+    const auto& confidence = supplied_confidence ? *supplied_confidence : derived_confidence;
     std::ostringstream output;
     output << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
               "<!DOCTYPE score-partwise PUBLIC \"-//Recordare//DTD MusicXML 4.0 Partwise//EN\" "
               "\"http://www.musicxml.org/dtds/partwise.dtd\">\n"
               "<score-partwise version=\"4.0\"><work><work-title>Transcription</work-title>"
-              "</work><part-list><score-part id=\"P1\"><part-name>"
+              "</work><identification><miscellaneous>"
+              "<miscellaneous-field name=\"transcriber-confidence-v1\">"
+           << xml_escape(serialize_confidence_report(confidence))
+           << "</miscellaneous-field></miscellaneous></identification>"
+              "<part-list><score-part id=\"P1\"><part-name>"
            << part_name << "</part-name></score-part>"
               "<score-part id=\"P2\"><part-name>"
            << part_name << " Tablature</part-name></score-part></part-list>\n";
@@ -1254,6 +1277,44 @@ std::string render_musicxml(const ScoreInterpretation& interpretation,
                     output << "      <direction><direction-type><words>"
                            << xml_escape("Uncertain interpretation: " + description.str())
                            << "</words></direction-type><staff>1</staff></direction>\n";
+                }
+            }
+            if (!tablature) {
+                int harmony_fifths = hypothesis.key.fifths;
+                if (!hypothesis.key.user_constrained) {
+                    for (const auto& region : hypothesis.local_tonal_context) {
+                        if (region.first_measure <= measure && measure < region.end_measure &&
+                            region.key.confidence >= 0.5) harmony_fifths = region.key.fifths;
+                    }
+                }
+                for (const auto* symbol : harmony_symbols) {
+                    const auto& harmony = *symbol;
+                    const int tick = to_tick(harmony.onset_quarters);
+                    if (measure_for_tick(tick) != measure) continue;
+                    const auto root = spell_written_pitch(
+                        60 + *harmony.chord.root_pitch_class +
+                            hypothesis.written_transposition_semitones,
+                        harmony_fifths);
+                    const std::string kind = harmony.chord.quality == "dominant-seventh" ?
+                        "dominant" : harmony.chord.quality == "half-diminished-seventh" ?
+                        "half-diminished" : harmony.chord.quality;
+                    output << "      <harmony><root><root-step>" << root.step << "</root-step>";
+                    if (root.alter != 0)
+                        output << "<root-alter>" << root.alter << "</root-alter>";
+                    output << "</root><kind>" << kind << "</kind>";
+                    if (harmony.chord.inversion && *harmony.chord.inversion != 0) {
+                        const auto bass = spell_written_pitch(
+                            harmony.chord.bass_midi_pitch +
+                                hypothesis.written_transposition_semitones,
+                            harmony_fifths);
+                        output << "<inversion>" << *harmony.chord.inversion
+                               << "</inversion><bass><bass-step>" << bass.step << "</bass-step>";
+                        if (bass.alter != 0)
+                            output << "<bass-alter>" << bass.alter << "</bass-alter>";
+                        output << "</bass>";
+                    }
+                    output << "<offset>" << tick - measure_starts[measure]
+                           << "</offset><staff>1</staff></harmony>\n";
                 }
             }
             for (std::size_t voice = 0; voice < score[measure].size(); ++voice) {
@@ -1335,8 +1396,9 @@ void write_musicxml(const std::filesystem::path& path,
     for (const auto& note : score.notes) {
         score_note_ids.push_back(note.id);
     }
+    const auto confidence = score_confidence(score);
     const auto xml = render_musicxml(interpretation, 0, options,
-                                     preserve_expressive_timing, &score_note_ids, &canonical_positions);
+        preserve_expressive_timing, &score_note_ids, &canonical_positions, &confidence);
     if (rendered_musicxml != nullptr) {
         *rendered_musicxml = xml;
     }

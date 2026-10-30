@@ -1,16 +1,17 @@
 # Transcriber
 
-Transcriber 0.1.8 is a C++20 audio-to-score CLI with an optional Windows
+Transcriber 0.1.9 is a C++20 audio-to-score CLI with an optional Windows
 WebView2 workstation as its sole graphical interface. It combines first-pass
 transcription with editable notation/tab, canonical score projects, evidence
 review, and reproducible build/package checks while retaining the
 dependency-light WAV/YIN default and explicit optional ONNX, FFmpeg, ASIO,
 WebView2, and Verovio integrations.
 
-This release is an early transcription aid, not a commercial-grade
-polyphonic automatic music transcription (AMT) system. The fast built-in YIN
-tracker is monophonic; the optional spectral path can identify simple
-polyphony, and both work best on clear recordings.
+This release remains an early transcription aid, not a commercial-grade
+polyphonic automatic music transcription (AMT) system. The default built-in
+YIN tracker is monophonic. Opt-in spectral and Basic Pitch paths can track
+overlapping notes, but are experimental and are not qualified for arbitrary
+mixtures or distorted recordings.
 
 Version 0.1.6 adds the evidence-oriented release workflow: deterministic,
 per-fixture synthetic regression gates; separated cold, warmup, and warm
@@ -33,6 +34,14 @@ refresh: the note timeline redraws when shown again, the waveform uses signed
 min/max bounds, and waveform/spectrogram previews retain the newest three
 seconds. Starting **New** clears project/source content while preserving setup
 preferences.
+
+Version 0.1.9 adds an opt-in tracked polyphonic event pipeline and chord
+identification, derived musical-analysis and confidence reports, persisted
+canonical correction history, ranked guitar-fingering alternatives, expanded
+dataset evaluation, and versioned model-provider contracts with explicit CLI
+backend selection. Existing defaults remain unchanged. These additions do not
+establish independent real-recording generalization or calibrated correctness
+probabilities; see the evaluation and confidence documentation.
 
 ## Architecture
 
@@ -122,6 +131,11 @@ windows and includes a compiled reference plugin.
 The [polyphonic adapter evaluation](docs/polyphonic.md) documents frame-by-pitch
 activations, opt-in aligned Basic Pitch onset/contour heads, and experimental
 harmonic competition, including measured real-guitar regressions.
+The opt-in [tracked polyphonic pipeline](docs/polyphonic-pipeline.md) adds
+independent onset/sustain/release tracking, overlapping canonical note events,
+and heuristic named chords. Use `--polyphonic --polyphonic-decoder tracked`
+or the workstation's offline polyphonic selection. Basic Pitch and an explicit
+model-free spectral mode share the tracker; existing CLI defaults are unchanged.
 The synthetic evaluation needs no model or dataset download and is registered
 with CTest when tests and Python are available.
 Measured DSP optimizations and the cold/warm CPU/memory benchmark workflow are
@@ -143,6 +157,14 @@ latency targets report misses without silently changing pitch accuracy.
 The separate [musical interpretation layer](docs/interpretation.md) preserves
 measured event times while producing ranked tempo, meter, key, rhythm and
 notation hypotheses for MusicXML and GUI score export.
+It also derives sounding-interval chords, scale alternatives and advisory
+harmonic checks without changing detected pitches. Supported chord symbols
+are exported automatically; `--events-json` includes the analysis and
+notation-quality metrics. Canonical project integrity payloads remain unchanged.
+The [confidence layer](docs/confidence.md) adds note evidence scores, phrase and
+transcription summaries, MusicXML metadata and uncertainty visualization.
+`--confidence-details` prints note/phrase details; uncalibrated detector scores
+are never labelled as correctness probabilities.
 The separate [guitar fingering solver](docs/guitar-fingering.md) ranks
 playability-aware sequence assignments and preserves manual corrections
 without changing sounding pitch.

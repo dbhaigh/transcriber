@@ -424,6 +424,66 @@ Use the new workflow for full quality diagnostics, repeated performance and
 compatible baseline comparisons. The stored historical 14.58% strict event F1 / 72.97% frame F1
 was not remeasured by this framework's synthetic tests.
 
+## MAESTRO, MAPS and MusicNet benchmarks
+
+The same evaluator accepts `--corpus maestro`, `--corpus maps`, and
+`--corpus musicnet`; GuitarSet remains available through its checked audio and
+annotation archives. These adapters read local datasets in place and do not
+download or redistribute audio or labels. Obtain each dataset under its
+upstream terms.
+
+```powershell
+$runner = ".\build-evaluation\transcriber-evaluate.exe"
+$buildInfo = ".\build-evaluation\evaluation-build-Release.json"
+$datasets = "$env:USERPROFILE\datasets"
+$common = @("--runner", $runner, "--build-info", $buildInfo,
+            "--backend", "spectral", "--mode", "full",
+            "--warmups", "0", "--repetitions", "1")
+
+python .\python\evaluate.py @common --corpus maestro `
+  --dataset-root "$datasets\maestro-v3.0.0" --dataset-split test `
+  --output-json .\python\evaluation\maestro-test.json `
+  --output-markdown .\python\evaluation\maestro-test.md
+
+python .\python\evaluate.py @common --corpus maps `
+  --dataset-root "$datasets\MAPS" --dataset-split all `
+  --output-json .\python\evaluation\maps-all.json `
+  --output-markdown .\python\evaluation\maps-all.md
+
+python .\python\evaluate.py @common --corpus musicnet `
+  --dataset-root "$datasets\MusicNet" --dataset-split test `
+  --output-json .\python\evaluation\musicnet-test.json `
+  --output-markdown .\python\evaluation\musicnet-test.md
+```
+
+MAESTRO reads `audio_filename`, `midi_filename`, and the published
+train/validation/test assignment from its versioned metadata CSV. MAPS pairs
+WAV and MIDI files by unique filename stem; it has no single canonical split
+in this adapter, so use `all` or point `--dataset-root` at a preselected
+subset. MusicNet reads the published `train_data`/`test_data` and matching
+`train_labels`/`test_labels` directories; annotation sample indices are
+converted using the dataset's 44.1 kHz timebase. Missing, ambiguous, malformed,
+or unmatched files fail the run rather than becoming empty predictions.
+
+Use `--limit N --seed 2026` for a deterministic subset; omit `--limit` to
+evaluate the selected split in full. Reports preserve the split policy,
+selected clip IDs, per-audio and per-annotation SHA-256 values, corpus
+identity, metric tolerances, source revision/file digests, build and model
+identity, environment, and run configuration. The JSON is the canonical
+machine-readable result; the Markdown contains the same aggregate metrics and
+per-clip results.
+
+The requested note precision, recall, and F1 use exact MIDI pitch and strict
+one-to-one note-event matching: onset within 50 ms and offset within
+`max(50 ms, 20% of reference duration)` by default. **Onset accuracy** is
+exact-pitch onset recall within the configured onset tolerance. **Offset
+accuracy** is the fraction of those onset matches whose offsets also satisfy
+the configured offset tolerance. **Polyphonic accuracy** is micro-aggregated
+framewise pitch-activity F1 at the configured 10 ms frame step; it is not
+frame-exact chord-set accuracy. Per-clip onset/offset error distributions and
+the underlying TP/FP/FN counts remain in the report. Change the tolerances
+only when the protocol is stated alongside the result.
+
 ## Regression coverage and known limits
 
 Existing tests and public overloads are preserved. Added Catch2 regressions

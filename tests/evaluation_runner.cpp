@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
         if (argc < 3) {
             throw std::invalid_argument(
                 "Usage: transcriber-evaluate input.wav output.json [--backend yin|spectral|onnx]"
-                " [--mode full|streaming|realtime] [--model path] [--provider cpu|cuda|directml|rocm]"
+                " [--mode full|streaming|realtime] [--model path] [--provider cpu|cuda|directml|rocm|tensorrt]"
                 " [--fast] [--serial] [--minimum-confidence value] [--chunk-seconds value]"
                 " [--overlap-seconds value] [--latency-ms value]");
         }
@@ -205,6 +205,7 @@ int main(int argc, char** argv) {
                 else if (value == "cuda") onnx.execution_provider = transcribe::OnnxExecutionProvider::Cuda;
                 else if (value == "directml") onnx.execution_provider = transcribe::OnnxExecutionProvider::DirectML;
                 else if (value == "rocm") onnx.execution_provider = transcribe::OnnxExecutionProvider::Rocm;
+                else if (value == "tensorrt") onnx.execution_provider = transcribe::OnnxExecutionProvider::TensorRT;
                 else throw std::invalid_argument("Unknown provider: " + value);
             } else if (flag == "--minimum-confidence") {
                 analysis.minimum_confidence = number(value);
@@ -456,8 +457,26 @@ int main(int argc, char** argv) {
                    << ",\"trimmed_edge_frames\":" << m.trimmed_edge_frames
                    << ",\"output_origin_seconds\":" << m.output_origin_seconds
                    << ",\"temporal_alignment\":" << json_string(m.temporal_alignment)
-                   << ",\"active_provider\":"
-                   << json_string(transcribe::inference_provider_name(*model_diagnostics.active_provider))
+                   << ",\"requested_provider\":"
+                   << json_string(transcribe::inference_provider_name(model_diagnostics.requested_provider))
+                   << ",\"active_provider\":";
+            if (model_diagnostics.active_provider) {
+                output << json_string(
+                    transcribe::inference_provider_name(*model_diagnostics.active_provider));
+            } else {
+                output << "null";
+            }
+            output << ",\"device_id\":" << model_diagnostics.device_id
+                   << ",\"active_device_id\":";
+            if (model_diagnostics.active_device_id) output << *model_diagnostics.active_device_id;
+            else output << "null";
+            output << ",\"cpu_fallback_allowed\":"
+                   << (model_diagnostics.cpu_fallback_allowed ? "true" : "false")
+                   << ",\"cpu_fallback_disabled\":"
+                   << (model_diagnostics.cpu_fallback_disabled ? "true" : "false")
+                   << ",\"cpu_fallback_used\":"
+                   << (model_diagnostics.cpu_fallback_used ? "true" : "false")
+                   << ",\"fallback_reason\":" << json_string(model_diagnostics.fallback_reason)
                    << ",\"runtime_version\":" << json_string(model_diagnostics.runtime_version)
                    << ",\"load_seconds\":" << model_resources.load_seconds
                    << ",\"model_file_bytes\":" << model_resources.model_file_bytes

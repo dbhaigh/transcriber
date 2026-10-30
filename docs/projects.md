@@ -75,7 +75,7 @@ integrity check.
 | `last_saved_path` | Last named save location; empty for unnamed sessions. Recovery hint, not the authority for resolving ordinary opens. |
 | `audio` | Policy, `reference_path`, `relative_to_project`, `sample_rate`, `channels`, `frame_count`, `original_reference`. Rates in Hz; frames are original interleaved sample frames, not channel samples. |
 | `analysis` | Settings and model references described below. |
-| `score` | Complete canonical score schema 1; no layout coordinates. |
+| `score` | Canonical score schema 2 with note-level correction records; schema-1 scores remain readable and retain their original canonical representation. No layout coordinates. |
 | `exports` | At most 32 unique format records (`musicxml`, `tablature`, `midi`), each with `format`, `path`, `score_revision`, `success`, `error`. Revision cannot be newer than the score. |
 | `annotations` | At most 4,096 `{id,note_id,text}` objects. IDs unique; empty `note_id` means project-wide. Nonempty IDs must reference existing canonical notes. Each text at most 16,384 UTF-8 bytes. |
 | `fingering_alternatives` | At most 16 ranked sequence snapshots, with at most 100,000 positions in total. Each has `cost`, nine `cost_components`, and `positions:[{note_id,string,fret}]`. Strings are 1-based; frets relative to capo. Stable IDs, not transient array indices. |
@@ -86,7 +86,10 @@ The canonical score retains measured onset/offset seconds, source sample rate,
 tempo-map/quarter mappings, editable note/rest/voice/rhythm/tie/spelling data,
 meter/key hypotheses and overrides, instrument name/transposition, 1-12-string
 tuning, capo/physical fret count, source events, evidence, review decisions,
-manual tab corrections and revision audit records. The existing
+manual tab corrections, revision audit records and correction snapshots.
+Schema-2 correction snapshots retain user accept/reject/insert/delete/pitch/
+timing/split/merge operations, before/after note state, source-event links and
+whether an edit remains active after undo/redo. The existing
 [score implementation](../include/transcribe/score.hpp) defines these types.
 MIDI, MusicXML, ASCII tablature and analysis JSON remain separate interchange
 formats and are not replaced by projects.

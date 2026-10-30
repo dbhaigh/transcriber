@@ -409,6 +409,175 @@ TEST_CASE("score commands split, merge, insert, and delete canonical elements",
     REQUIRE(editor.document().rests.size() == inferred_rest_count);
 }
 
+TEST_CASE("human note corrections retain linked evidence and undo state",
+          "[score][editing][corrections][serialization]") {
+    auto original = sample_score();
+    const auto note_id = original.notes.front().id;
+    const auto source_ids = original.notes.front().source_event_ids;
+    const auto source_events = original.source_events;
+    transcribe::ScoreEditor editor(original);
+
+    transcribe::ScoreTransaction correction;
+    correction.base_revision = editor.document().revision;
+    correction.actor = "reviewer-1";
+    correction.reason = "Confirm and correct the detected note";
+    correction.command_id = "correction-1";
+    correction.commands = {
+        transcribe::AcceptScoreNote{note_id},
+        transcribe::ChangeScorePitch{note_id, 62},
+        transcribe::ReinterpretScoreRhythm{
+            note_id, 0.3, 1.5,
+            transcribe::RhythmValue{2, 0, 0, 0, 1.5, 0.0, true}},
+    };
+    editor.apply(correction);
+
+    REQUIRE(editor.document().schema_version == transcribe::score_schema_version);
+    REQUIRE(editor.document().corrections.size() == 3);
+    REQUIRE(editor.document().corrections[0].operation ==
+            transcribe::ScoreCorrectionKind::Accepted);
+    REQUIRE_FALSE(editor.document().corrections[0].before.front().user_accepted);
+    REQUIRE(editor.document().corrections[0].after.front().user_accepted);
+    REQUIRE(editor.document().corrections[1].operation ==
+            transcribe::ScoreCorrectionKind::PitchAdjusted);
+    REQUIRE(editor.document().corrections[1].before.front().sounding_midi_pitch == 60);
+    REQUIRE(editor.document().corrections[1].after.front().sounding_midi_pitch == 62);
+    REQUIRE(editor.document().corrections[1].after.front().source_event_ids == source_ids);
+    REQUIRE(editor.document().corrections[2].operation ==
+            transcribe::ScoreCorrectionKind::TimingAdjusted);
+    REQUIRE(editor.document().corrections[2].before.front().onset_quarters !=
+            editor.document().corrections[2].after.front().onset_quarters);
+    REQUIRE(editor.document().notes.front().sounding_midi_pitch == 62);
+    REQUIRE(editor.document().notes.front().user_accepted);
+    REQUIRE(editor.document().notes.front().source_event_ids == source_ids);
+    REQUIRE(editor.document().source_events.size() == source_events.size());
+    REQUIRE(editor.document().source_events.front().evidence.size() ==
+            source_events.front().evidence.size());
+    REQUIRE(editor.document().source_events.front().evidence.front().raw_strength ==
+            source_events.front().evidence.front().raw_strength);
+
+    const auto serialized =
+        transcribe::serialize_score_document(editor.document());
+    const auto restored = transcribe::deserialize_score_document(serialized);
+    REQUIRE(transcribe::serialize_score_document(restored) == serialized);
+    REQUIRE(restored.corrections.size() == 3);
+    REQUIRE(restored.corrections.front().actor == "reviewer-1");
+    REQUIRE(restored.corrections.front().command_id == "correction-1");
+
+    editor.undo(editor.document().revision);
+    REQUIRE_FALSE(editor.document().notes.front().user_accepted);
+    REQUIRE(editor.document().corrections.size() == 3);
+    REQUIRE(std::all_of(editor.document().corrections.begin(),
+        editor.document().corrections.end(),
+        [](const auto& item) { return !item.active; }));
+    editor.redo(editor.document().revision);
+    REQUIRE(editor.document().notes.front().user_accepted);
+    REQUIRE(std::all_of(editor.document().corrections.begin(),
+        editor.document().corrections.end(),
+        [](const auto& item) { return item.active; }));
+}
+
+TEST_CASE("split merge and reject corrections preserve source-event links",
+          "[score][editing][corrections]") {
+    auto document = sample_score();
+    auto first = document.notes.front();
+    first.duration_quarters = 2.0;
+    first.rhythm.duration_quarters = 2.0;
+    document.notes.front() = first;
+    document.total_quarters = std::max(document.total_quarters, 2.0);
+    transcribe::ScoreEditor editor(std::move(document));
+
+    transcribe::ScoreTransaction split;
+    split.base_revision = editor.document().revision;
+    split.command_id = "semantic-split";
+    split.commands.emplace_back(
+        transcribe::SplitScoreNote{first.id, 1.0, "split-continuation"});
+    editor.apply(split);
+    REQUIRE(editor.document().corrections.back().operation ==
+            transcribe::ScoreCorrectionKind::Split);
+    REQUIRE(editor.document().corrections.back().before.size() == 1);
+    REQUIRE(editor.document().corrections.back().after.size() == 2);
+    REQUIRE(editor.document().corrections.back().after[0].source_event_ids ==
+            editor.document().corrections.back().after[1].source_event_ids);
+
+    transcribe::ScoreTransaction merge;
+    merge.base_revision = editor.document().revision;
+    merge.command_id = "semantic-merge";
+    merge.commands.emplace_back(transcribe::MergeScoreNotes{
+        first.id, "split-continuation", first.id});
+    editor.apply(merge);
+    REQUIRE(editor.document().corrections.back().operation ==
+            transcribe::ScoreCorrectionKind::Merged);
+    REQUIRE(editor.document().corrections.back().before.size() == 2);
+    REQUIRE(editor.document().corrections.back().after.size() == 1);
+    REQUIRE(editor.document().corrections.back().after.front().note_id == first.id);
+
+    const auto original_event_count = editor.document().source_events.size();
+    transcribe::ScoreTransaction reject;
+    reject.base_revision = editor.document().revision;
+    reject.command_id = "semantic-reject";
+    reject.commands.emplace_back(transcribe::RejectScoreNote{first.id});
+    editor.apply(reject);
+    REQUIRE(editor.document().corrections.back().operation ==
+            transcribe::ScoreCorrectionKind::Rejected);
+    REQUIRE(editor.document().corrections.back().before.front().source_event_ids ==
+            first.source_event_ids);
+    REQUIRE(editor.document().source_events.size() == original_event_count);
+    REQUIRE(std::none_of(editor.document().notes.begin(),
+        editor.document().notes.end(),
+        [&](const auto& note) { return note.id == first.id; }));
+}
+
+TEST_CASE("merging notes across a gap preserves the full corrected duration",
+          "[score][editing][corrections]") {
+    auto document = sample_score();
+    const auto first = document.notes.front();
+    auto& second = document.notes.back();
+    second.sounding_midi_pitch = first.sounding_midi_pitch;
+    second.written_midi_pitch = first.written_midi_pitch;
+    second.spelling_step = first.spelling_step;
+    second.spelling_alter = first.spelling_alter;
+    second.spelling_octave = first.spelling_octave;
+    second.accidental_required = first.accidental_required;
+    second.onset_quarters += 0.5;
+    document.total_quarters = std::max(
+        document.total_quarters, second.onset_quarters + second.duration_quarters);
+    const double expected_duration =
+        second.onset_quarters + second.duration_quarters - first.onset_quarters;
+    transcribe::ScoreEditor editor(std::move(document));
+
+    transcribe::ScoreTransaction merge;
+    merge.base_revision = editor.document().revision;
+    merge.commands.emplace_back(transcribe::MergeScoreNotes{
+        first.id, second.id, first.id});
+    editor.apply(merge);
+
+    REQUIRE(editor.document().notes.size() == 1);
+    REQUIRE(editor.document().notes.front().id == first.id);
+    REQUIRE(editor.document().notes.front().duration_quarters ==
+            Catch::Approx(expected_duration));
+}
+
+TEST_CASE("score schema one remains readable and correction edits upgrade it",
+          "[score][migration][corrections]") {
+    auto legacy = sample_score();
+    legacy.schema_version = transcribe::legacy_score_schema_version;
+    const auto legacy_json = transcribe::serialize_score_document(legacy);
+    REQUIRE(legacy_json.find("\"schema_version\":1") != std::string::npos);
+    REQUIRE(legacy_json.find("\"corrections\"") == std::string::npos);
+    REQUIRE(legacy_json.find("\"user_accepted\"") == std::string::npos);
+    const auto restored = transcribe::deserialize_score_document(legacy_json);
+    REQUIRE(restored.schema_version == transcribe::legacy_score_schema_version);
+
+    transcribe::ScoreEditor editor(restored);
+    transcribe::ScoreTransaction accept;
+    accept.base_revision = editor.document().revision;
+    accept.commands.emplace_back(
+        transcribe::AcceptScoreNote{editor.document().notes.front().id});
+    editor.apply(accept);
+    REQUIRE(editor.document().schema_version == transcribe::score_schema_version);
+    REQUIRE(editor.document().corrections.size() == 1);
+}
+
 TEST_CASE("score migration accepts version zero and rejects unknown future schemas",
           "[score][serialization]") {
     const auto migrated = transcribe::deserialize_score_document(

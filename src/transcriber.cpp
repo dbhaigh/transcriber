@@ -673,6 +673,18 @@ void append_execution_provider(Ort::SessionOptions& options,
         throw std::runtime_error(
             "ROCm provider selection requires TRANSCRIBE_ONNX_ENABLE_ROCM=ON.");
 #endif
+    case OnnxExecutionProvider::TensorRT:
+#ifdef TRANSCRIBE_ONNX_ENABLE_TENSORRT
+    {
+        OrtTensorRTProviderOptions provider_options{};
+        provider_options.device_id = device_id;
+        options.AppendExecutionProvider_TensorRT(provider_options);
+        return;
+    }
+#else
+        throw std::runtime_error(
+            "TensorRT provider selection requires TRANSCRIBE_ONNX_ENABLE_TENSORRT=ON.");
+#endif
     case OnnxExecutionProvider::DirectML:
 #ifdef TRANSCRIBE_ONNX_ENABLE_DIRECTML
     {
@@ -2687,7 +2699,8 @@ std::vector<ProviderAvailability> onnx_providers() {
     runtime = Ort::GetAvailableProviders();
 #endif
     for (const auto provider : {OnnxExecutionProvider::Cpu, OnnxExecutionProvider::Cuda,
-                               OnnxExecutionProvider::DirectML, OnnxExecutionProvider::Rocm}) {
+                               OnnxExecutionProvider::DirectML, OnnxExecutionProvider::Rocm,
+                               OnnxExecutionProvider::TensorRT}) {
         bool compiled = false;
         std::string name;
         switch (provider) {
@@ -2712,6 +2725,12 @@ std::vector<ProviderAvailability> onnx_providers() {
         case OnnxExecutionProvider::Rocm:
             name = "ROCMExecutionProvider";
 #ifdef TRANSCRIBE_ONNX_ENABLE_ROCM
+            compiled = true;
+#endif
+            break;
+        case OnnxExecutionProvider::TensorRT:
+            name = "TensorrtExecutionProvider";
+#ifdef TRANSCRIBE_ONNX_ENABLE_TENSORRT
             compiled = true;
 #endif
             break;

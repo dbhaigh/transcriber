@@ -36,6 +36,13 @@ WAV / FFmpeg / ASIO acquisition (outside engines)
   exactly. Opting into `EngineConfiguration::segmentation` invokes the existing
   canonical decoder over retained frame evidence. Configuration validation uses
   the existing temporal-decoder validator.
+- **Tracked polyphony:** the optional
+  `EngineConfiguration::polyphonic_decoding` composes a finite-recording
+  independent-pitch lifecycle tracker and sounding-interval chord identification.
+  `EngineUpdate::polyphonic` retains canonical events, named chord segments and
+  capacity diagnostics. It rejects monophonic objectives, concurrent legacy
+  segmentation and live `begin()` rather than ignoring an incompatible option.
+  See [tracked pipeline](polyphonic-pipeline.md) for thresholds and limits.
 - **Musical interpretation/export:** remain separate. Engines never assign
   tempo, voices, spelling, strings/frets, UI selection or playback state.
 - **UI:** receives owned updates, not internal mutable inference buffers.
@@ -103,10 +110,15 @@ Capabilities describe:
 
 Selection is deterministic: the first registered candidate satisfying the
 request wins; other candidates remain in the response with explanations. It
-does not benchmark/rank quality, infer an instrument, download a model, silently
-choose another provider, or load a session. “Available” is a **preflight**:
-`initialize` must still validate tensor compatibility and allocate runtime
-resources. Built-ins always require CPU, irrespective of optional ONNX builds.
+does not benchmark/rank quality, infer an instrument, download a model or load a
+session. Provider switching is strict by default. If
+`EngineRequirements::allow_cpu_fallback` is enabled, preflight may select an
+engine that can run on CPU when the requested provider is unavailable;
+`initialize` must also receive `ModelLoadOptions::allow_cpu_fallback=true`.
+Diagnostics report the requested and active provider. “Available” is a
+**preflight**: `initialize` must still validate tensor compatibility and
+allocate runtime resources. Built-ins run on CPU; a non-CPU request is accepted
+only when explicit CPU fallback is enabled.
 
 ```cpp
 transcribe::EngineRegistry engines(model_path); // {} for model-free operation

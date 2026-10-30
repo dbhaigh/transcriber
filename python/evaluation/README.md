@@ -1,5 +1,15 @@
 # Measured evaluation records
 
+## Musical interpretation
+
+[`musical-interpretation-synthetic.json`](musical-interpretation-synthetic.json)
+records 24 original symbolic cadences (all major/minor tonics, 3/4 and 4/4,
+60/90/120/180 BPM) evaluated by `transcriber-musical-evaluate`. It reports
+key/meter/tempo accuracy, ambiguity, duration-weighted chord root/quality
+accuracy, scale membership and source-evidence preservation. See the
+[protocol and limits](../../docs/interpretation.md#musical-analysis-metrics).
+These scores validate symbolic semantics, not real-recording accuracy.
+
 ## Current reproducible evaluation workflow
 
 The framework command, scoring definitions, v2 deterministic cases, and
@@ -13,6 +23,13 @@ The [polyphonic evaluation](../../docs/polyphonic.md) adds corpus v3 while
 preserving v1/v2 inputs, and records paired frame/event metrics on a
 performer-separated GuitarSet subset. Synthetic harmonic-competition gains
 did not translate into a real-guitar improvement; that alternative stays opt-in.
+
+The [tracked polyphonic pipeline evaluation](../../docs/polyphonic-pipeline.md#real-recording-evaluation)
+uses `evaluate_polyphonic.py`. It compares the tracked decoder with the existing
+decoders on the GuitarSet performer-05 test split and on guitar-free TRIOS
+ensemble mixes. The results are in `polyphonic-tracked-guitarset-test.json`
+and `polyphonic-tracked-trios.json`, with notes, chords, paired bootstrap
+intervals, failed runs and provenance.
 
 No stable v2/v3 performance or quality baseline is claimed by this framework
 change. The CTest v2/v3 suites are one-repetition correctness smokes only; do
@@ -236,3 +253,24 @@ For new GuitarSet measurements, `--dataset-split` uses fixed performer groups:
 protocol split, not proof that an existing model has not trained on a test
 performer. The historical 360-recording report above remains an all-recordings
 result and is not retroactively represented as a held-out test result.
+
+## Additional real-audio datasets
+
+`python/evaluate.py` supports MAESTRO, MAPS, MusicNet, and GuitarSet reports.
+The adapters normalize MIDI and MusicNet sample-index annotations into the
+same note-event schema and record dataset/audio/annotation hashes, split
+policy, selected clip IDs, tolerances, source identity, build identity, and
+model identity. Each run can emit canonical JSON and a Markdown report.
+
+See the [multi-dataset protocols and commands](../../docs/evaluation.md#maestro-maps-and-musicnet-benchmarks)
+for expected directory layouts, split behavior, metric definitions, and
+reproducible commands. MAPS requires a user-selected subset when a specific
+benchmark split is intended; this adapter does not invent a universal split.
+
+The generated [GuitarSet performer-05 Basic Pitch JSON report](guitarset-test-basic-pitch-v1.json)
+and [Markdown summary](guitarset-test-basic-pitch-v1.md) cover all 60 test
+recordings. Strict note-event precision/recall/F1 are **9.21% / 18.74% /
+12.35%**; onset accuracy is **46.98%**, offset accuracy **39.20%**, and
+polyphonic framewise F1 **72.60%**. These measurements preserve the possible
+Basic Pitch/GuitarSet training overlap caveat; they are not an independent
+generalization claim.

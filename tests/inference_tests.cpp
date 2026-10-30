@@ -339,6 +339,184 @@ TEST_CASE("truncated WAV is rejected before advertising its declared allocation"
         REQUIRE_THROWS(transcribe::read_wav(fixture.path));
 }
 
+namespace {
+class TestModelContract final : public transcribe::IModelContract {
+public:
+    std::string_view id() const noexcept override { return "test.polyphonic-midi"; }
+    std::uint32_t version() const noexcept override { return 1; }
+    transcribe::ModelOperation validate(const transcribe::ModelDefinition& definition) const override {
+        if (definition.contract != transcribe::ModelContract::Custom ||
+            definition.objective != transcribe::PitchObjective::IndependentMultiPitch ||
+            definition.provenance.empty() || definition.license.empty()) {
+            return transcribe::InferenceError{
+                transcribe::InferenceErrorCode::InvalidArgument, "Invalid test model contract"};
+        }
+        return std::monostate{};
+    }
+};
+
+class TestProviderSession final : public transcribe::IInferenceSession {
+public:
+    explicit TestProviderSession(transcribe::ModelDefinition definition) {
+        metadata_.definition = std::move(definition);
+        metadata_.polyphonic = true;
+        metadata_.objective = transcribe::PitchObjective::IndependentMultiPitch;
+        metadata_.minimum_midi = 28;
+        metadata_.maximum_midi = 96;
+    }
+    const transcribe::ModelMetadata& metadata() const noexcept override { return metadata_; }
+    transcribe::ModelOperation load(const transcribe::ModelLoadOptions& options) override {
+        resources_.loaded = true;
+        diagnostics_.requested_provider = options.provider;
+        diagnostics_.active_provider = options.provider;
+        diagnostics_.device_id = options.device_id;
+        diagnostics_.active_device_id = options.device_id;
+        return std::monostate{};
+    }
+    void release() noexcept override { resources_ = {}; diagnostics_ = {}; }
+    transcribe::InferenceResult<transcribe::InferenceOutput> infer(
+        const transcribe::AudioBuffer&, const transcribe::InferenceRequest&) override {
+        if (!resources_.loaded) {
+            return transcribe::InferenceError{
+                transcribe::InferenceErrorCode::NotLoaded, "Test provider session is not loaded"};
+        }
+        return transcribe::InferenceOutput{};
+    }
+    transcribe::ModelOperation warm_up(const transcribe::InferenceRequest&) override {
+        return resources_.loaded ? transcribe::ModelOperation{std::monostate{}} :
+            transcribe::ModelOperation{transcribe::InferenceError{
+                transcribe::InferenceErrorCode::NotLoaded, "Test provider session is not loaded"}};
+    }
+    transcribe::ModelResources resources() const noexcept override { return resources_; }
+    transcribe::BackendDiagnostics diagnostics() const override { return diagnostics_; }
+
+private:
+    transcribe::ModelMetadata metadata_;
+    transcribe::ModelResources resources_;
+    transcribe::BackendDiagnostics diagnostics_;
+};
+
+class TestModelProvider final : public transcribe::IModelProvider {
+public:
+    explicit TestModelProvider(std::string provider_id)
+        : provider_id_(std::move(provider_id)), contract_(std::make_shared<TestModelContract>()) {}
+    std::string_view id() const noexcept override { return provider_id_; }
+    transcribe::InferenceResult<std::vector<transcribe::ModelDefinition>> discover_models() const override {
+        if (discovery_error_) {
+            return transcribe::InferenceError{
+                transcribe::InferenceErrorCode::ModelLoad, "Injected provider discovery error"};
+        }
+        return definitions_;
+    }
+    transcribe::InferenceResult<std::shared_ptr<const transcribe::IModelContract>> contract_for(
+        const transcribe::ModelDefinition& definition) const override {
+        if (definition.contract != transcribe::ModelContract::Custom) {
+            return transcribe::InferenceError{
+                transcribe::InferenceErrorCode::InvalidArgument, "Unsupported test model contract"};
+        }
+        return std::shared_ptr<const transcribe::IModelContract>(contract_);
+    }
+    transcribe::InferenceResult<std::unique_ptr<transcribe::IInferenceSession>> create_session(
+        const transcribe::ModelDefinition& definition) const override {
+        return std::unique_ptr<transcribe::IInferenceSession>(
+            std::make_unique<TestProviderSession>(definition));
+    }
+    void add(transcribe::ModelDefinition definition) { definitions_.push_back(std::move(definition)); }
+    void fail_discovery(bool value) { discovery_error_ = value; }
+
+private:
+    std::string provider_id_;
+    std::vector<transcribe::ModelDefinition> definitions_;
+    std::shared_ptr<const TestModelContract> contract_;
+    bool discovery_error_{};
+};
+
+transcribe::ModelDefinition custom_test_model(
+    std::string id, std::string provenance) {
+    transcribe::ModelDefinition definition;
+    definition.id = std::move(id);
+    definition.contract = transcribe::ModelContract::Custom;
+    definition.provenance = std::move(provenance);
+    definition.license = "test-only";
+    definition.objective = transcribe::PitchObjective::IndependentMultiPitch;
+    return definition;
+}
+} // namespace
+
+TEST_CASE("model providers discover validated models and switch sessions explicitly", "[inference][providers]") {
+    transcribe::ModelRegistry registry;
+    auto cpu_provider = std::make_shared<TestModelProvider>("test-cpu");
+    auto accelerator_provider = std::make_shared<TestModelProvider>("test-accelerator");
+    cpu_provider->add(custom_test_model("test:polyphonic", "CPU test provider"));
+    accelerator_provider->add(custom_test_model("test:polyphonic", "accelerator test provider"));
+    REQUIRE(std::holds_alternative<std::monostate>(registry.register_provider(cpu_provider)));
+    REQUIRE(std::holds_alternative<std::monostate>(registry.register_provider(accelerator_provider)));
+
+    auto discovered = registry.discover_models();
+    REQUIRE(std::holds_alternative<std::vector<transcribe::ModelRegistration>>(discovered));
+    const auto& models = std::get<std::vector<transcribe::ModelRegistration>>(discovered);
+    REQUIRE(std::count_if(models.begin(), models.end(), [](const auto& model) {
+        return model.definition.id == "test:polyphonic";
+    }) == 2);
+    for (const auto& model : models) {
+        if (model.definition.id == "test:polyphonic") {
+            REQUIRE(model.contract_id == "test.polyphonic-midi");
+            REQUIRE(model.semantic_version == 1);
+        }
+    }
+
+    const auto ambiguous = registry.create_session("test:polyphonic");
+    REQUIRE(std::holds_alternative<transcribe::InferenceError>(ambiguous));
+    REQUIRE(std::get<transcribe::InferenceError>(ambiguous).message.find("specify provider_id") !=
+        std::string::npos);
+    auto cpu_session_result = registry.create_session("test:polyphonic", "test-cpu");
+    REQUIRE(std::holds_alternative<std::unique_ptr<transcribe::IInferenceSession>>(cpu_session_result));
+    auto cpu_session =
+        std::move(std::get<std::unique_ptr<transcribe::IInferenceSession>>(cpu_session_result));
+    REQUIRE(cpu_session->metadata().definition.provenance == "CPU test provider");
+    REQUIRE(std::holds_alternative<std::monostate>(cpu_session->load()));
+    REQUIRE(std::holds_alternative<transcribe::InferenceOutput>(cpu_session->infer(model_tone())));
+
+    auto accelerator_session_result =
+        registry.create_session("test:polyphonic", "test-accelerator");
+    REQUIRE(std::holds_alternative<std::unique_ptr<transcribe::IInferenceSession>>(
+        accelerator_session_result));
+    auto accelerator_session = std::move(
+        std::get<std::unique_ptr<transcribe::IInferenceSession>>(accelerator_session_result));
+    REQUIRE(accelerator_session->metadata().definition.provenance == "accelerator test provider");
+
+    cpu_provider->add(custom_test_model("test:discovered-later", "runtime catalog update"));
+    discovered = registry.discover_models();
+    REQUIRE(std::holds_alternative<std::vector<transcribe::ModelRegistration>>(discovered));
+    REQUIRE(std::count_if(std::get<std::vector<transcribe::ModelRegistration>>(discovered).begin(),
+        std::get<std::vector<transcribe::ModelRegistration>>(discovered).end(), [](const auto& model) {
+            return model.definition.id == "test:discovered-later";
+        }) == 1);
+
+    cpu_provider->fail_discovery(true);
+    discovered = registry.discover_models();
+    REQUIRE(std::holds_alternative<transcribe::InferenceError>(discovered));
+    REQUIRE(std::get<transcribe::InferenceError>(discovered).message ==
+        "Injected provider discovery error");
+    REQUIRE(std::holds_alternative<transcribe::InferenceError>(
+        registry.register_provider(std::make_shared<TestModelProvider>("test-cpu"))));
+
+    transcribe::ModelRegistry invalid_registry;
+    auto invalid_provider = std::make_shared<TestModelProvider>("test-invalid-contract");
+    auto invalid_definition = custom_test_model("test:invalid-contract", "invalid test model");
+    invalid_definition.license.clear();
+    invalid_provider->add(invalid_definition);
+    REQUIRE(std::holds_alternative<std::monostate>(
+        invalid_registry.register_provider(invalid_provider)));
+    const auto invalid_discovery = invalid_registry.discover_models();
+    REQUIRE(std::holds_alternative<transcribe::InferenceError>(invalid_discovery));
+    REQUIRE(std::get<transcribe::InferenceError>(invalid_discovery).message ==
+        "Invalid test model contract");
+    REQUIRE(std::holds_alternative<transcribe::InferenceError>(invalid_registry.add(
+        custom_test_model("test:custom-static", "custom contract"),
+        [](const auto&) { return std::unique_ptr<transcribe::IInferenceSession>{}; })));
+}
+
 TEST_CASE("model registry versions discovery and custom factories are explicit", "[inference]") {
     transcribe::ModelRegistry registry;
     REQUIRE(registry.discover().size() == 2);
@@ -440,6 +618,36 @@ TEST_CASE("built-in model adapters preserve notes own lifetimes and report cance
     }
 }
 
+TEST_CASE("CPU fallback is opt-in and reports requested versus active provider", "[inference][providers]") {
+    transcribe::ModelRegistry registry;
+    auto created = registry.create("builtin:yin");
+    REQUIRE(std::holds_alternative<std::unique_ptr<transcribe::IInferenceSession>>(created));
+    auto session = std::move(
+        std::get<std::unique_ptr<transcribe::IInferenceSession>>(created));
+
+    transcribe::ModelLoadOptions options;
+    options.provider = transcribe::OnnxExecutionProvider::Cuda;
+    auto result = session->load(options);
+    REQUIRE(std::holds_alternative<transcribe::InferenceError>(result));
+    REQUIRE(session->diagnostics().requested_provider == transcribe::OnnxExecutionProvider::Cuda);
+    REQUIRE_FALSE(session->diagnostics().active_provider);
+    REQUIRE(session->diagnostics().cpu_fallback_disabled);
+    REQUIRE_FALSE(session->diagnostics().cpu_fallback_used);
+
+    options.allow_cpu_fallback = true;
+    result = session->load(options);
+    REQUIRE(std::holds_alternative<std::monostate>(result));
+    const auto diagnostics = session->diagnostics();
+    REQUIRE(diagnostics.requested_provider == transcribe::OnnxExecutionProvider::Cuda);
+    REQUIRE(diagnostics.active_provider == transcribe::OnnxExecutionProvider::Cpu);
+    REQUIRE(diagnostics.active_device_id == 0);
+    REQUIRE(diagnostics.cpu_fallback_allowed);
+    REQUIRE_FALSE(diagnostics.cpu_fallback_disabled);
+    REQUIRE(diagnostics.cpu_fallback_used);
+    REQUIRE(diagnostics.fallback_reason.find("only support CPU") != std::string::npos);
+    REQUIRE(diagnostics.message.find("explicit CPU fallback") != std::string::npos);
+}
+
 TEST_CASE("ONNX model discovery and unavailable providers never claim a fallback", "[inference]") {
     transcribe::ModelRegistry registry;
     transcribe::ModelDefinition definition{1, "test:onnx", transcribe::ModelContract::BasicPitchV1,
@@ -453,7 +661,11 @@ TEST_CASE("ONNX model discovery and unavailable providers never claim a fallback
     auto created = registry.create(definition.id);
     auto backend = std::move(std::get<std::unique_ptr<transcribe::ModelBackend>>(created));
     const auto providers = transcribe::inference_providers();
-    REQUIRE(providers.size() == 4);
+    REQUIRE(providers.size() == 5);
+    REQUIRE(transcribe::inference_provider_name(transcribe::OnnxExecutionProvider::TensorRT) == "tensorrt");
+    REQUIRE(std::count_if(providers.begin(), providers.end(), [](const auto& provider) {
+        return provider.provider == transcribe::OnnxExecutionProvider::TensorRT;
+    }) == 1);
     for (const auto& provider : providers) {
         if (provider.compiled && provider.runtime_available) continue;
         transcribe::ModelLoadOptions options;
@@ -465,6 +677,27 @@ TEST_CASE("ONNX model discovery and unavailable providers never claim a fallback
         REQUIRE_FALSE(std::get<transcribe::InferenceError>(result).message.empty());
     }
 #ifdef TRANSCRIBE_ENABLE_ONNX
+    const auto cpu = std::find_if(providers.begin(), providers.end(), [](const auto& provider) {
+        return provider.provider == transcribe::OnnxExecutionProvider::Cpu;
+    });
+    const auto unavailable_accelerator = std::find_if(providers.begin(), providers.end(), [](const auto& provider) {
+        return provider.provider != transcribe::OnnxExecutionProvider::Cpu &&
+            (!provider.compiled || !provider.runtime_available);
+    });
+    if (cpu != providers.end() && cpu->compiled && cpu->runtime_available &&
+        unavailable_accelerator != providers.end()) {
+        transcribe::ModelLoadOptions fallback;
+        fallback.provider = unavailable_accelerator->provider;
+        fallback.allow_cpu_fallback = true;
+        REQUIRE(std::holds_alternative<std::monostate>(backend->load(fallback)));
+        const auto diagnostics = backend->diagnostics();
+        REQUIRE(diagnostics.requested_provider == unavailable_accelerator->provider);
+        REQUIRE(diagnostics.active_provider == transcribe::OnnxExecutionProvider::Cpu);
+        REQUIRE(diagnostics.cpu_fallback_used);
+        REQUIRE_FALSE(diagnostics.cpu_fallback_disabled);
+        REQUIRE_FALSE(diagnostics.fallback_reason.empty());
+        backend->release();
+    }
     REQUIRE(std::holds_alternative<std::monostate>(backend->load()));
     REQUIRE(backend->resources().live_sessions == 1);
     REQUIRE(backend->metadata().inputs.size() == 1);

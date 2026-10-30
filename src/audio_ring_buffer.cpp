@@ -18,9 +18,14 @@ std::size_t AudioRingBuffer::write(std::span<const float> samples) noexcept {
     const std::size_t read_position = read_position_.load(std::memory_order_acquire);
     const std::size_t used = write_position - read_position;
     const std::size_t count = std::min(samples.size(), storage_.size() - used);
-    for (std::size_t i = 0; i < count; ++i) {
-        storage_[write_offset_] = samples[i];
-        if (++write_offset_ == storage_.size()) write_offset_ = 0;
+    if (count != 0) {
+        const std::size_t first = std::min(count, storage_.size() - write_offset_);
+        std::copy_n(samples.data(), first, storage_.data() + write_offset_);
+        if (first < count) {
+            std::copy_n(samples.data() + first, count - first, storage_.data());
+        }
+        write_offset_ += count;
+        if (write_offset_ >= storage_.size()) write_offset_ -= storage_.size();
     }
     write_position_.store(write_position + count, std::memory_order_release);
     return count;
@@ -31,9 +36,14 @@ std::size_t AudioRingBuffer::read(std::span<float> samples) noexcept {
     const std::size_t write_position = write_position_.load(std::memory_order_acquire);
     const std::size_t available = write_position - read_position;
     const std::size_t count = std::min(samples.size(), available);
-    for (std::size_t i = 0; i < count; ++i) {
-        samples[i] = storage_[read_offset_];
-        if (++read_offset_ == storage_.size()) read_offset_ = 0;
+    if (count != 0) {
+        const std::size_t first = std::min(count, storage_.size() - read_offset_);
+        std::copy_n(storage_.data() + read_offset_, first, samples.data());
+        if (first < count) {
+            std::copy_n(storage_.data(), count - first, samples.data() + first);
+        }
+        read_offset_ += count;
+        if (read_offset_ >= storage_.size()) read_offset_ -= storage_.size();
     }
     read_position_.store(read_position + count, std::memory_order_release);
     return count;

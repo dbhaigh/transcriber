@@ -374,7 +374,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-interface", action="store_true")
     parser.add_argument("--verify-legacy", action="store_true")
     parser.add_argument("--onnx-model", type=Path)
-    parser.add_argument("--provider", choices=("cpu", "cuda", "directml", "rocm"), default="cpu")
+    parser.add_argument("--provider", choices=("cpu", "cuda", "directml", "rocm", "tensorrt"), default="cpu")
     parser.add_argument("--repetitions", type=int, default=4)
     parser.add_argument("--long-recordings", action="store_true")
     parser.add_argument("--long-seconds", type=int, default=120)

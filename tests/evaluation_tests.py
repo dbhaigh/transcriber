@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import random
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,7 @@ from evaluate import build_identity, compare, human_report, markdown_report
 import evaluate
 from evaluate_guitarset import md5_file, read_reference_events
 import evaluate_guitarset
+from evaluation_datasets import maestro_corpus, maps_corpus, musicnet_corpus
 sys.path.insert(0, str(ROOT / "python" / "models"))
 from acquire import acquire
 from performance import compare_reports, percentile, long_report_markdown, summarize_timings
@@ -43,6 +45,33 @@ PERFORMANCE_RUNNER = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else None
 
 def event(pitch=69, start=0.0, duration=1.0):
     return dict(midi=pitch, start=start, duration=duration)
+
+
+def _test_variable_length(value):
+    groups = [value & 0x7F]
+    value >>= 7
+    while value:
+        groups.append((value & 0x7F) | 0x80)
+        value >>= 7
+    return bytes(reversed(groups))
+
+
+def _test_midi_file(pitch=60, ticks=480):
+    body = (b"\x00\x90" + bytes((pitch, 100)) +
+            _test_variable_length(ticks) + b"\x80" + bytes((pitch, 0)) +
+            b"\x00\xff\x2f\x00")
+    track = b"MTrk" + struct.pack(">I", len(body)) + body
+    header = b"MThd" + struct.pack(">IHHH", 6, 1, 1, 480)
+    return header + track
+
+
+def _write_test_wav(path, sample_rate=44_100):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate)
+        audio.writeframes(b"\x00\x00" * sample_rate)
 
 
 class MetricsTests(unittest.TestCase):
@@ -303,6 +332,18 @@ class MetricsTests(unittest.TestCase):
             tp=0, fp=1, fn=0, precision=0, recall=0, f1=0))
         self.assertEqual(extra["false_positives_per_minute"], 1)
 
+    def test_requested_onset_offset_and_polyphonic_metric_contract(self):
+        tolerances = Tolerances(.05, .05, 0, .01)
+        result = score_events(
+            [event()], [event(start=.02, duration=.90)], 1, tolerances
+        )
+        self.assertEqual(result["note_event"]["f1"], 0)
+        self.assertEqual(result["onset_accuracy"], dict(
+            correct=1, reference=1, value=1))
+        self.assertEqual(result["offset_accuracy"], dict(
+            correct=0, onset_matches=1, value=0))
+        self.assertEqual(result["polyphonic_accuracy"], result["frame"]["f1"])
+
     def test_pitch_events_are_overlap_matched_and_one_to_one(self):
         reference = [event(60, 0, 2), event(64, 0, 2)]
         predictions = [event(60, 1, 1), event(60, 1, 1), event(65, 0, 2)]
@@ -555,6 +596,125 @@ class CorpusTests(unittest.TestCase):
                         evaluate_guitarset.evaluate(legacy_args)
 
 
+class DatasetAdapterTests(unittest.TestCase):
+    def test_cli_accepts_requested_local_datasets(self):
+        for corpus in ("maestro", "maps", "musicnet"):
+            arguments = [
+                "evaluate.py", "--runner", "runner.exe", "--build-info", "build.json",
+                "--output-json", "report.json", "--corpus", corpus,
+                "--dataset-root", "dataset",
+            ]
+            with patch.object(sys, "argv", arguments):
+                parsed = evaluate.parse_args()
+            self.assertEqual(parsed.corpus, corpus)
+            self.assertEqual(parsed.dataset_root, Path("dataset"))
+
+    def test_maestro_preserves_metadata_split_and_reproducible_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "maestro"
+            records = []
+            for split, stem in (("train", "piece-a"), ("validation", "piece-b"),
+                                ("test", "piece-c")):
+                _write_test_wav(root / "2020" / f"{stem}.wav")
+                (root / "2020" / f"{stem}.midi").write_bytes(_test_midi_file())
+                records.append(f"{split},2020/{stem}.wav,2020/{stem}.midi")
+            metadata = root / "maestro-v3.0.0.csv"
+            metadata.parent.mkdir(parents=True, exist_ok=True)
+            metadata.write_text(
+                "split,audio_filename,midi_filename\n" + "\n".join(records) + "\n",
+                encoding="utf-8",
+            )
+
+            first = maestro_corpus(root, "test", None, 2026)
+            second = maestro_corpus(root, "test", None, 2026)
+            routed = evaluate.real_corpus(SimpleNamespace(
+                corpus="maestro", dataset_root=root, dataset_split="test",
+                limit=None, seed=2026, audio_zip=None, annotations_zip=None,
+            ), root)
+            self.assertEqual(first["version"], "3.0.0")
+            self.assertEqual(first["sha256"], second["sha256"])
+            self.assertEqual(first, routed)
+            self.assertEqual(first["clips"][0]["id"], "2020/piece-c")
+            self.assertEqual(first["clips"][0]["dataset_split"], "test")
+            self.assertEqual(first["clips"][0]["notes"][0]["instrument"], "piano")
+            self.assertEqual(first["clips"][0]["annotation_sha256"],
+                             second["clips"][0]["annotation_sha256"])
+
+            arguments = SimpleNamespace(
+                runner=Path("runner.exe"), build_info=Path("build.json"),
+                corpus="maestro", dataset_root=root, dataset_split="test",
+                audio_zip=None, annotations_zip=None, limit=None, seed=2026,
+                model=None, model_identifier=None, backend="yin", mode="streaming",
+                fast=False, serial=True, minimum_confidence=.25, provider="cpu",
+                corpus_version=1, chunk_seconds=15, overlap_seconds=1, latency_ms=40,
+                polyphonic_decoder="legacy", model_objective=None, neural_decoder="legacy",
+                temporal=False, model_interface=False, warmups=0, repetitions=1,
+                onset_tolerance=.05, offset_tolerance=.05, offset_ratio=.2, frame_step=.01,
+                timeout_seconds=120,
+            )
+            predictions = [{"midi": 60, "start": 0.0, "duration": .5}]
+            runner_output = {
+                "notes": predictions, "sample_rate": 44_100, "duration_seconds": 1.0,
+                "decode_seconds": 0.0, "decode_included_in_analysis": False,
+                "analysis_seconds": .01, "total_seconds": .01, "peak_resident_bytes": 1024,
+                "events": [], "first_update_seconds": None, "inference_skipped": False,
+                "canonical_events": [],
+            }
+            audio_inputs = []
+            def invoke_fixture(_arguments, audio_path, _output):
+                audio_inputs.append(audio_path.resolve())
+                return runner_output, .01
+
+            with patch.object(evaluate, "build_identity", return_value={"build_type": "test"}), \
+                 patch.object(evaluate, "source_identity", return_value={"files_sha256": {}}), \
+                 patch.object(evaluate, "invoke", side_effect=invoke_fixture):
+                report = evaluate.evaluate(arguments)
+            self.assertEqual(audio_inputs, [(root / "2020" / "piece-c.wav").resolve()])
+            self.assertEqual(report["summary"]["f1_score"], 1)
+            self.assertEqual(report["clips"][0]["annotation_sha256"],
+                             first["clips"][0]["annotation_sha256"])
+
+    def test_maps_pairs_audio_and_midi_by_stem_and_requires_explicit_subset_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "MAPS"
+            for subset, stem in (("AkPnBcht", "piece-a"), ("ENSTDkCl", "piece-b")):
+                _write_test_wav(root / subset / f"{stem}.wav")
+                (root / subset / f"{stem}.mid").write_bytes(_test_midi_file())
+            corpus = maps_corpus(root, "all", None, 2026)
+            self.assertEqual(corpus["name"], "MAPS")
+            self.assertEqual(len(corpus["clips"]), 2)
+            self.assertEqual(
+                {clip["id"] for clip in corpus["clips"]},
+                {"AkPnBcht/piece-a", "ENSTDkCl/piece-b"},
+            )
+            with self.assertRaisesRegex(ValueError, "no canonical split"):
+                maps_corpus(root, "test", None, 2026)
+
+    def test_musicnet_converts_sample_indices_and_preserves_train_test_split(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "MusicNet"
+            for split, track in (("train", "100"), ("test", "200")):
+                _write_test_wav(root / f"{split}_data" / f"{track}.wav")
+                labels = root / f"{split}_labels" / f"{track}.csv"
+                labels.parent.mkdir(parents=True, exist_ok=True)
+                labels.write_text(
+                    "start_time,end_time,instrument,note,note_label\n"
+                    "4410,22050,1,60,C4\n",
+                    encoding="utf-8",
+                )
+
+            test = musicnet_corpus(root, "test", None, 2026)
+            note = test["clips"][0]["notes"][0]
+            self.assertEqual(test["clips"][0]["id"], "test/200")
+            self.assertEqual(test["clips"][0]["dataset_split"], "test")
+            self.assertAlmostEqual(note["start"], .1)
+            self.assertAlmostEqual(note["duration"], .4)
+            self.assertEqual(test["provenance"]["annotation_timebase_hz"], 44_100)
+            self.assertEqual(len(musicnet_corpus(root, "all", None, 2026)["clips"]), 2)
+            with self.assertRaisesRegex(ValueError, "train/test"):
+                musicnet_corpus(root, "validation", None, 2026)
+
+
 class IntegrationTests(unittest.TestCase):
     def setUp(self):
         if RUNNER is None or BUILD_INFO is None:
@@ -636,7 +796,11 @@ class IntegrationTests(unittest.TestCase):
                     self.assertEqual(old["metrics"], new["metrics"])
                     metadata = new["runs"][0]["model_interface"]
                     self.assertEqual(metadata["version"], 1)
+                    self.assertEqual(metadata["requested_provider"], "cpu")
                     self.assertEqual(metadata["active_provider"], "cpu")
+                    self.assertEqual(metadata["active_device_id"], 0)
+                    self.assertFalse(metadata["cpu_fallback_allowed"])
+                    self.assertFalse(metadata["cpu_fallback_used"])
                     self.assertFalse(metadata["incremental"])
                     self.assertEqual(metadata["batch_size"], 1)
                     if backend == "onnx":
@@ -882,12 +1046,19 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(markdown.read_text(encoding="utf-8"), markdown_report(report))
             self.assertEqual(len(report["clips"]), 16)
             self.assertEqual(report["timing_protocol"]["repetitions"], 2)
+            for name in ("note_precision", "note_recall", "f1_score", "onset_accuracy",
+                         "offset_accuracy", "polyphonic_accuracy"):
+                self.assertIn(name, report["summary"])
+            self.assertIn("Requested benchmark metrics", markdown.read_text(encoding="utf-8"))
             for row in report["clips"]:
                 self.assertEqual(len(row["runs"]), 2)
                 self.assertEqual(row["sample_rate"], 22050)
                 self.assertIn("frame", row["metrics"])
                 self.assertIn("pitch_event", row["metrics"])
                 self.assertIn("note_event", row["metrics"])
+                self.assertIn("onset_accuracy", row["metrics"])
+                self.assertIn("offset_accuracy", row["metrics"])
+                self.assertIn("polyphonic_accuracy", row["metrics"])
                 self.assertIn("scenarios", row)
                 self.assertIn("peak_resident_bytes", row["runs"][0])
             for name in ("empty", "silence"):

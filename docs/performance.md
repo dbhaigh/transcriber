@@ -263,13 +263,98 @@ was deferred. The ASIO device callback is unchanged: bounded ring writes and
 atomics only, with no FFT/model/UI/disk work, allocation or mutex added.
 FFT plan initialization happens on analysis/preview paths, not that callback.
 
-Spectral salience/candidate extraction, ring-copy modulo operations, redundant
-ONNX conversions and same-rate buffer copies were reviewed but not changed:
-the available profiles did not isolate them as the dominant costs, and this
-experiment does not justify unrelated numerical/ownership changes. Approximate
-sliding-window YIN and fast-math SIMD were specifically avoided. Further
-optimization should use the same quality gates and representative labeled
-recordings, not tune the simple synthetic guitar scale.
+Spectral salience/candidate extraction, redundant ONNX conversions and same-rate
+buffer copies remain deferred: the available profiles do not isolate them as
+dominant costs. Approximate sliding-window YIN and fast-math SIMD were
+specifically avoided. The ASIO ring transfer loop is the exception: a focused
+microbenchmark justified changing its per-sample copies to contiguous copies,
+without changing the data or publication order.
+
+## Follow-up audit: profiling plan and ring benchmark
+
+The ASIO [CaptureTransport](../src/asio_transport.hpp) preallocates separate
+recording and analysis SPSC rings. Both consumers need independent lifetimes, so
+the two copies are intentional; the callback adds no allocation, lock, FFT,
+inference, UI or disk work. The previous ring implementation advanced and
+checked its wrap position for every sample. [AudioRingBuffer read/write](../src/audio_ring_buffer.cpp)
+now copies each block in one contiguous range, or two ranges when it wraps.
+Atomic publication and partial-read/write behavior are unchanged. Existing
+concurrent tests in [asio_tests.cpp](../tests/asio_tests.cpp) exercise arbitrary
+capacities and verify every sample.
+
+The [audio ring benchmark](../tests/audio_ring_buffer_benchmark.cpp) isolates
+the transfer loop across 32-4096 sample blocks. Each run transfers 4,194,304
+samples through a non-power-of-two ring capacity, with five repetitions; ring
+construction and the final exact sample check are outside the timed interval.
+On the local Release build, the 512-sample median fell from 4.9536 ms to
+0.3711 ms (13.35x); aggregate read plus write throughput increased from
+6,459.9 to 86,230.1 MiB/s. The 32-1024 sample cases improved 2.80x-14.15x.
+The 4096-sample case had visibly higher run-to-run variance. This is a
+cache-resident, single-thread microbenchmark, not an ASIO callback latency
+measurement or a hard real-time claim.
+
+Other findings and measurement limits:
+
+- The existing immutable FFT plans, cached Hann windows and worker-private
+  workspaces avoid repeated plan/window construction and per-frame allocation.
+  Current onset and pitch stage timers include more than FFT work, so they
+  cannot attribute a change to an individual transform.
+- The offline scheduler is bounded to eight workers and does not create nested
+  pools. Stage wall time and process CPU time reveal scaling, but not context
+  switching or cache misses.
+- The long-file runner reports process high-water RSS, not allocation counts,
+  allocation sites or per-call peaks. A sample-content hash and spectrogram
+  cache lookup also require a full audio scan.
+- `capture_asio` requests 512 frames at 44.1 kHz. The unit tests validate ring
+  concurrency and sample integrity, but they do not measure a physical ASIO
+  driver or establish a callback deadline.
+
+### Profiling plan
+
+1. Use a Release build and record the executable/source digests, compiler,
+   build flags, CPU, provider, input hashes, sample rate, channel count, chunk
+   size and scheduling mode. Compare only matching configurations.
+2. Run [performance.py](../python/performance.py) on the generated labeled
+   workloads and, where available, a consented local recording. Preserve its
+   cold and warm runs, stage timings, process CPU/wall time, peak RSS, exact
+   note output and labeled metrics. Compare serial and parallel runs separately.
+3. Use a sampled CPU profiler to find instruction-level hotspots: Windows
+   Performance Recorder/Analyzer, Visual Studio CPU Usage, or VTune; on Linux,
+   `perf record -g` and `perf stat -d`. Attribute FFT time by sampled call
+   stacks and normalize by frame count. Keep cold plan initialization separate
+   from warm transforms.
+4. Measure heap allocations with a native allocation trace (Visual Studio
+   Native Memory/ETW heap events on Windows, or `heaptrack` on Linux). Record
+   count, size and call site separately from RSS. Also identify copies by
+   call stack and bytes moved; do not infer allocation totals from working-set
+   size.
+5. For cache locality, capture hardware cache-miss and memory-bandwidth
+   counters on representative long inputs. Treat the ring microbenchmark as a
+   transfer-kernel check only; use an end-to-end trace to decide whether
+   spectrogram traversal or other DSP buffers are cache-bound.
+6. For threading, capture worker count, CPU-core equivalents, context switches
+   and wall time for the same workload in serial and parallel modes. Do not add
+   a second thread pool or interpret more CPU consumption as lower latency.
+7. For real-time safety, profile the physical ASIO callback externally without
+   logging or adding locks/allocations to it. Record callback-duration p50/p99/
+   maximum against the configured buffer period, along with driver overflow,
+   refused blocks and queue high-water marks. Repeat on supported hardware;
+   simulated ring tests are not a substitute.
+8. Reject any optimization that changes emitted notes, confidence or sample
+   ordering. Keep exact ring sample checks, exact benchmark note comparison and
+   labeled quality gates; report hardware-only timing as an observation, not a
+   CI threshold or a real-time guarantee.
+
+Build and run the focused microbenchmark with:
+
+```powershell
+cmake --build build-performance --config Release --target transcriber-audio-ring-benchmark
+.\build-performance\transcriber-audio-ring-benchmark.exe
+```
+
+Its JSON output goes to stdout. The CTest smoke case checks that the benchmark
+executes and preserves samples; it intentionally has no machine-dependent
+speed threshold.
 
 ## Reproduce
 

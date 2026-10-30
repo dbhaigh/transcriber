@@ -5,13 +5,14 @@
 
 #include <memory>
 #include <stop_token>
+#include <string_view>
 #include <variant>
 
 namespace transcribe {
 
 inline constexpr std::uint32_t model_contract_version = 1;
 
-enum class ModelContract { Yin, Spectral, BasicPitchV1, LegacyPitchV1 };
+enum class ModelContract { Yin, Spectral, BasicPitchV1, LegacyPitchV1, Custom };
 enum class InferenceErrorCode {
     InvalidArgument, Unsupported, NotLoaded, Cancelled, ModelLoad, Inference
 };
@@ -39,6 +40,21 @@ struct ModelDefinition {
     std::string provenance;
     std::string license;
     PitchObjective objective{PitchObjective::Unspecified};
+};
+
+struct ModelRegistration {
+    ModelDefinition definition;
+    std::string provider_id;
+    std::string contract_id;
+    std::uint32_t semantic_version{};
+};
+
+class IModelContract {
+public:
+    virtual ~IModelContract() = default;
+    virtual std::string_view id() const noexcept = 0;
+    virtual std::uint32_t version() const noexcept = 0;
+    virtual ModelOperation validate(const ModelDefinition& definition) const = 0;
 };
 
 enum class ModelHeadRole { PitchActivity, Onset, Contour };
@@ -96,6 +112,7 @@ struct ModelLoadOptions {
     std::size_t maximum_result_cache_bytes{};
     // Zero preserves the existing unrestricted offline-input contract; bounded WAV is separate.
     std::size_t maximum_input_bytes{};
+    bool allow_cpu_fallback{};
 };
 
 struct InferenceRequest {
@@ -134,12 +151,16 @@ struct BackendDiagnostics {
     std::string runtime_version;
     bool cpu_fallback_disabled{};
     std::string message;
+    std::optional<int> active_device_id;
+    bool cpu_fallback_allowed{};
+    bool cpu_fallback_used{};
+    std::string fallback_reason;
 };
 
 // Instances are single-owner/non-reentrant. No inference runs on a capture callback.
-class ModelBackend {
+class IInferenceSession {
 public:
-    virtual ~ModelBackend() = default;
+    virtual ~IInferenceSession() = default;
     virtual const ModelMetadata& metadata() const noexcept = 0;
     virtual ModelOperation load(const ModelLoadOptions& options = {}) = 0;
     virtual void release() noexcept = 0;
@@ -152,18 +173,45 @@ public:
     virtual BackendDiagnostics diagnostics() const = 0;
 };
 
-class ModelRegistry {
+using ModelBackend = IInferenceSession;
+
+class IModelProvider {
 public:
-    using Factory = std::function<std::unique_ptr<ModelBackend>(const ModelDefinition&)>;
+    virtual ~IModelProvider() = default;
+    virtual std::string_view id() const noexcept = 0;
+    virtual InferenceResult<std::vector<ModelDefinition>> discover_models() const = 0;
+    virtual InferenceResult<std::shared_ptr<const IModelContract>> contract_for(
+        const ModelDefinition& definition) const = 0;
+    virtual InferenceResult<std::unique_ptr<IInferenceSession>> create_session(
+        const ModelDefinition& definition) const = 0;
+};
+
+class IModelRegistry {
+public:
+    virtual ~IModelRegistry() = default;
+    virtual ModelOperation register_provider(std::shared_ptr<IModelProvider> provider) = 0;
+    virtual InferenceResult<std::vector<ModelRegistration>> discover_models() const = 0;
+    virtual InferenceResult<std::unique_ptr<IInferenceSession>> create_session(
+        std::string_view model_id, std::string_view provider_id = {}) const = 0;
+};
+
+class ModelRegistry final : public IModelRegistry {
+public:
+    using Factory = std::function<std::unique_ptr<IInferenceSession>(const ModelDefinition&)>;
     explicit ModelRegistry(const std::filesystem::path& onnx_path = {});
-    ModelOperation add(ModelDefinition definition, Factory factory);
+    ModelOperation add(ModelDefinition definition, Factory factory, std::string provider_id = "factory");
     ModelOperation add_onnx(ModelDefinition definition);
+    ModelOperation register_provider(std::shared_ptr<IModelProvider> provider) override;
+    InferenceResult<std::vector<ModelRegistration>> discover_models() const override;
+    InferenceResult<std::unique_ptr<IInferenceSession>> create_session(
+        std::string_view model_id, std::string_view provider_id = {}) const override;
     std::vector<ModelDefinition> discover() const;
-    InferenceResult<std::unique_ptr<ModelBackend>> create(const std::string& id) const;
+    InferenceResult<std::unique_ptr<IInferenceSession>> create(const std::string& id) const;
 
 private:
-    struct Entry { ModelDefinition definition; Factory factory; };
+    struct Entry { ModelDefinition definition; Factory factory; std::string provider_id; };
     std::vector<Entry> entries_;
+    std::vector<std::shared_ptr<IModelProvider>> providers_;
 };
 
 struct FileInferenceOptions {

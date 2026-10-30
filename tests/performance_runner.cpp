@@ -115,6 +115,7 @@ int main(int argc, char** argv) {
             if (name == "cuda") provider = transcribe::OnnxExecutionProvider::Cuda;
             else if (name == "directml") provider = transcribe::OnnxExecutionProvider::DirectML;
             else if (name == "rocm") provider = transcribe::OnnxExecutionProvider::Rocm;
+            else if (name == "tensorrt") provider = transcribe::OnnxExecutionProvider::TensorRT;
             else if (name != "cpu") throw std::invalid_argument("Unknown requested provider");
             transcribe::ModelRegistry registry;
             const auto id = backend == "onnx" ? "benchmark:basic-pitch" : "builtin:" + backend;
@@ -306,6 +307,14 @@ int main(int argc, char** argv) {
             output << ",\"model_interface\":{\"contract_version\":1,\"provider\":\""
                    << transcribe::inference_provider_name(provider)
                    << "\",\"cpu_fallback_disabled\":" << (diagnostics.cpu_fallback_disabled ? "true" : "false")
+                   << ",\"cpu_fallback_allowed\":" << (diagnostics.cpu_fallback_allowed ? "true" : "false")
+                   << ",\"cpu_fallback_used\":" << (diagnostics.cpu_fallback_used ? "true" : "false")
+                   << ",\"active_provider\":";
+            if (diagnostics.active_provider)
+                output << "\"" << transcribe::inference_provider_name(*diagnostics.active_provider) << "\"";
+            else
+                output << "null";
+            output
                    << ",\"load_seconds\":" << resources.load_seconds
                    << ",\"model_file_bytes\":" << resources.model_file_bytes
                    << ",\"live_sessions\":" << resources.live_sessions

@@ -1,11 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(transcriber VERSION 0.1.8 LANGUAGES CXX)
+project(transcriber VERSION 0.1.9 LANGUAGES CXX)
 
 option(TRANSCRIBE_ENABLE_ASIO "Build real-time capture using RtAudio's ASIO backend" OFF)
 option(TRANSCRIBE_ENABLE_ONNX "Build ONNX Runtime model inference support" OFF)
 option(TRANSCRIBE_ONNX_ENABLE_CUDA "Enable ONNX Runtime CUDA execution provider selection" OFF)
 option(TRANSCRIBE_ONNX_ENABLE_DIRECTML "Enable ONNX Runtime DirectML execution provider selection" OFF)
 option(TRANSCRIBE_ONNX_ENABLE_ROCM "Enable ONNX Runtime ROCm execution provider selection" OFF)
+option(TRANSCRIBE_ONNX_ENABLE_TENSORRT "Enable ONNX Runtime TensorRT execution provider selection" OFF)
+if(TRANSCRIBE_ONNX_ENABLE_TENSORRT AND NOT TRANSCRIBE_ENABLE_ONNX)
+    message(FATAL_ERROR "TensorRT execution provider selection requires TRANSCRIBE_ENABLE_ONNX=ON.")
+endif()
 set(ONNXRUNTIME_ROOT "" CACHE PATH "ONNX Runtime installation root")
 set(TRANSCRIBE_DIRECTML_SDK_ROOT "" CACHE PATH
     "Root of the DirectML SDK containing DirectML.h")
@@ -129,7 +133,10 @@ add_library(transcriber_core STATIC
     src/decoding.cpp
     src/inference.cpp
     src/engine.cpp
+    src/polyphonic_pipeline.cpp
     src/interpretation.cpp
+    src/confidence.cpp
+    src/musical_analysis.cpp
     src/score.cpp
     src/project.cpp
     src/review.cpp
@@ -156,7 +163,7 @@ endif()
 target_compile_definitions(transcriber PRIVATE
     TRANSCRIBE_VERSION="${PROJECT_VERSION}")
 
-if(WIN32 AND TRANSCRIBE_ENABLE_WEBVIEW2)
+if(TRANSCRIBE_BUILD_TESTS OR (WIN32 AND TRANSCRIBE_ENABLE_WEBVIEW2))
     add_library(transcriber_gui_backend STATIC src/gui_transcription.cpp)
     target_link_libraries(transcriber_gui_backend PUBLIC transcriber_core)
     target_compile_features(transcriber_gui_backend PUBLIC cxx_std_20)
@@ -343,6 +350,10 @@ if(TRANSCRIBE_ENABLE_ONNX)
         target_compile_definitions(transcriber_core PRIVATE
             TRANSCRIBE_ONNX_ENABLE_ROCM=1)
     endif()
+    if(TRANSCRIBE_ONNX_ENABLE_TENSORRT)
+        target_compile_definitions(transcriber_core PRIVATE
+            TRANSCRIBE_ONNX_ENABLE_TENSORRT=1)
+    endif()
     if(TRANSCRIBE_ONNX_ENABLE_DIRECTML)
         find_path(ONNXRUNTIME_DML_INCLUDE_DIR dml_provider_factory.h
             HINTS "${ONNXRUNTIME_ROOT}" ENV ONNXRUNTIME_ROOT
@@ -414,15 +425,19 @@ if(TRANSCRIBE_BUILD_TESTS)
         tests/inference_tests.cpp
         tests/engine_tests.cpp
         tests/polyphonic_tests.cpp
+        tests/polyphonic_pipeline_tests.cpp
+        tests/polyphonic_gui_tests.cpp
         tests/live_tests.cpp
         tests/live_bridge_tests.cpp
         tests/interpretation_tests.cpp)
+    target_sources(transcriber-tests PRIVATE tests/musical_analysis_tests.cpp)
+    target_sources(transcriber-tests PRIVATE tests/confidence_tests.cpp)
     target_sources(transcriber-tests PRIVATE
         tests/fingering_tests.cpp tests/score_tests.cpp tests/review_tests.cpp
         tests/project_tests.cpp)
     target_sources(transcriber-tests PRIVATE tests/preprocessing_tests.cpp)
     target_sources(transcriber-tests PRIVATE tests/asio_tests.cpp)
-    target_link_libraries(transcriber-tests PRIVATE transcriber_core Catch2::Catch2WithMain)
+    target_link_libraries(transcriber-tests PRIVATE transcriber_core transcriber_gui_backend Catch2::Catch2WithMain)
     target_compile_features(transcriber-tests PRIVATE cxx_std_20)
     if(TRANSCRIBE_ENABLE_ONNX)
         file(TO_CMAKE_PATH
@@ -437,8 +452,26 @@ if(TRANSCRIBE_BUILD_TESTS)
     add_test(NAME engine_plugin_example COMMAND transcriber-engine-example)
     target_link_libraries(transcriber-evaluate PRIVATE transcriber_core)
     add_executable(transcriber-performance tests/performance_runner.cpp)
+    add_executable(transcriber-audio-ring-benchmark
+        tests/audio_ring_buffer_benchmark.cpp)
+    target_link_libraries(transcriber-audio-ring-benchmark PRIVATE transcriber_core)
+    add_test(NAME audio_ring_buffer_benchmark_smoke
+        COMMAND "$<TARGET_FILE:transcriber-audio-ring-benchmark>" --smoke)
+    set_tests_properties(audio_ring_buffer_benchmark_smoke PROPERTIES
+        LABELS "audio;benchmark" TIMEOUT 60)
+    add_executable(transcriber-fingering-benchmark tests/fingering_benchmark.cpp)
+    target_link_libraries(transcriber-fingering-benchmark PRIVATE transcriber_core)
+    add_test(NAME fingering_engine_benchmark
+        COMMAND "$<TARGET_FILE:transcriber-fingering-benchmark>" --smoke)
+    set_tests_properties(fingering_engine_benchmark PROPERTIES
+        LABELS "fingering;benchmark" TIMEOUT 60)
     add_executable(transcriber-live tests/live_runner.cpp)
     add_executable(transcriber-notation tests/notation_runner.cpp)
+    add_executable(transcriber-musical-evaluate tests/musical_analysis_evaluation.cpp)
+    target_link_libraries(transcriber-musical-evaluate PRIVATE transcriber_core)
+    add_test(NAME musical_interpretation_evaluation COMMAND transcriber-musical-evaluate)
+    set_tests_properties(musical_interpretation_evaluation PROPERTIES
+        LABELS "interpretation;evaluation" TIMEOUT 60)
     target_link_libraries(transcriber-notation PRIVATE transcriber_core)
     target_link_libraries(transcriber-live PRIVATE transcriber_core)
     target_link_libraries(transcriber-performance PRIVATE transcriber_core)
@@ -447,12 +480,29 @@ if(TRANSCRIBE_BUILD_TESTS)
         target_link_libraries(transcriber-performance PRIVATE psapi)
     endif()
     foreach(target transcriber-tests transcriber-evaluate
-                   transcriber-performance transcriber-live transcriber-notation transcriber-engine-example)
+                   transcriber-performance transcriber-audio-ring-benchmark
+                   transcriber-fingering-benchmark
+                   transcriber-live transcriber-notation transcriber-engine-example
+                   transcriber-musical-evaluate)
         transcriber_apply_warnings(${target})
         transcriber_apply_sanitizers(${target})
     endforeach()
     include(Catch)
     catch_discover_tests(transcriber-tests)
+    find_program(TRANSCRIBE_NODE_EXECUTABLE node)
+    if(TRANSCRIBE_NODE_EXECUTABLE)
+        add_test(NAME polyphonic_cli_pipeline
+            COMMAND "${TRANSCRIBE_NODE_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/polyphonic_cli_tests.js" "$<TARGET_FILE:transcriber>")
+        set_tests_properties(polyphonic_cli_pipeline PROPERTIES TIMEOUT 60 LABELS "polyphonic")
+        if(TRANSCRIBE_ENABLE_ONNX)
+            add_test(NAME polyphonic_cli_pipeline_onnx
+                COMMAND "${TRANSCRIBE_NODE_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/polyphonic_cli_tests.js" "$<TARGET_FILE:transcriber>"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/python/models/basic_pitch.onnx")
+            set_tests_properties(polyphonic_cli_pipeline_onnx PROPERTIES TIMEOUT 60 LABELS "polyphonic;onnx")
+        endif()
+    endif()
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
@@ -493,6 +543,10 @@ if(TRANSCRIBE_BUILD_TESTS)
                 "$<TARGET_FILE:transcriber-evaluate>"
                 "${CMAKE_CURRENT_BINARY_DIR}/evaluation-build-$<CONFIG>.json"
                 "$<TARGET_FILE:transcriber-performance>")
+        add_test(NAME polyphonic_evaluation_framework
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/polyphonic_evaluation_tests.py")
+        set_tests_properties(polyphonic_evaluation_framework PROPERTIES LABELS "polyphonic;evaluation")
         add_test(NAME synthetic_evaluation
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/evaluate.py"
                 --runner "$<TARGET_FILE:transcriber-evaluate>"

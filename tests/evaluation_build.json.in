@@ -25,7 +25,8 @@
     "webview2": $<IF:$<BOOL:@TRANSCRIBE_ENABLE_WEBVIEW2@>,true,false>,
     "onnx_cuda": $<IF:$<BOOL:@TRANSCRIBE_ONNX_ENABLE_CUDA@>,true,false>,
     "onnx_directml": $<IF:$<BOOL:@TRANSCRIBE_ONNX_ENABLE_DIRECTML@>,true,false>,
-    "onnx_rocm": $<IF:$<BOOL:@TRANSCRIBE_ONNX_ENABLE_ROCM@>,true,false>
+    "onnx_rocm": $<IF:$<BOOL:@TRANSCRIBE_ONNX_ENABLE_ROCM@>,true,false>,
+    "onnx_tensorrt": $<IF:$<BOOL:@TRANSCRIBE_ONNX_ENABLE_TENSORRT@>,true,false>
   },
   "executable": "$<TARGET_FILE:transcriber>",
   "runner": @EVAL_RUNNER@

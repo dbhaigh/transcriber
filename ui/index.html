@@ -261,10 +261,14 @@
               Applies to Spectral and ONNX live capture. The selected interval must fit the model window.
             </p>
             <label class="check-row" for="polyphonic">
-              <input id="polyphonic" type="checkbox" disabled>
+              <input id="polyphonic" type="checkbox">
               <span class="check-custom" aria-hidden="true"></span>
-              <span>Polyphonic model inference</span>
+              <span>Polyphonic notes and chords (offline, up to 120 s)</span>
             </label>
+            <p class="field-hint">
+              Uses Basic Pitch when a model is selected, otherwise spectral DSP.
+              Chord names are heuristic; live capture uses its separate backend selector.
+            </p>
             <label class="check-row review-mode-control" for="review-mode">
               <input id="review-mode" type="checkbox">
               <span class="check-custom" aria-hidden="true"></span>
@@ -585,7 +589,7 @@
         </section>
         <section class="inspector-card">
           <div class="inspector-heading"><span>CALIBRATION</span><span>Only validated probabilities</span></div>
-          <canvas id="confidence-heatmap" aria-label="Calibrated correctness estimates, when available"></canvas>
+          <canvas id="confidence-heatmap" aria-label="Note confidence over time: dashed evidence scores, solid calibrated estimates, gray unassessed"></canvas>
           <p class="field-hint">Grey events have no calibrated correctness estimate.</p>
         </section>
 
@@ -598,7 +602,8 @@
             <label>String <select id="edit-string" disabled></select></label>
             <label>Fret <input id="edit-fret" type="number" min="0" max="36" disabled></label>
             <button id="apply-note-edit" class="button button-small" type="button" disabled>Apply edit</button>
-            <button id="delete-note" class="button button-small button-quiet" type="button" disabled>Delete</button>
+            <button id="accept-note" class="button button-small" type="button" disabled>Accept note</button>
+            <button id="delete-note" class="button button-small button-quiet" type="button" disabled>Reject note</button>
             <button id="split-note" class="button button-small" type="button" disabled
                     title="Split at midpoint; preserves the original measured evidence">Split in half</button>
             <button id="merge-note" class="button button-small" type="button" disabled
@@ -613,6 +618,14 @@
           <details class="setup-details">
             <summary>Live latency and queue diagnostics</summary>
             <p id="live-diagnostics" class="context-help">Diagnostics appear during capture.</p>
+          </details>
+          <details id="confidence-panel" class="setup-details">
+            <summary>Confidence &amp; uncertainty</summary>
+            <p id="confidence-summary" class="context-help" role="status">No accepted confidence assessment.</p>
+            <ol id="phrase-confidence" class="confidence-phrases"></ol>
+            <p class="context-help">Evidence scores are heuristic, not correctness probabilities.
+              Dashed note outlines mark low confidence; unassessed and user-edited notes are labelled separately.
+              Phrase and transcription values are means, not probabilities that every note is correct.</p>
           </details>
           <div id="note-list" class="note-list"><div class="empty-notes">No note events yet.</div></div>
         </section>

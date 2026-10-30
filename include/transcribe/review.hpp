@@ -85,6 +85,7 @@ struct CalibrationReport {
     std::string dataset_identifier;
     std::size_t sample_count{};
     std::optional<double> brier_score;
+    std::optional<double> expected_calibration_error;
     std::vector<ReliabilityBin> reliability_bins;
 };
 

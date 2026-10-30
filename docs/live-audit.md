@@ -1,8 +1,13 @@
 # Live ASIO-to-UI path audit
 
+> Historical snapshot: this audit records the Transcriber 0.1.6 checkout. Its
+> implementation observations and build/test results are not current release
+> status. See [release evidence](release-evidence.md) and
+> [reliability guidance](reliability.md) for current qualification details.
+
 Audit scope: the Windows ASIO live-capture route through the WebView2 UI, as
-implemented in this checkout. This is a source audit, not verification against
-an ASIO device or browser paint timing.
+implemented in the audited checkout. This is a source audit, not verification
+against an ASIO device or browser paint timing.
 
 ## Path summary
 

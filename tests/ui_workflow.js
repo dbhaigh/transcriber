@@ -73,6 +73,14 @@ window.runTranscriberWorkflowTests = async (studio) => {
     "Sample position conversion");
   require(timeline.time(timeline.x(3, 10, 500), 10, 500) === 3, "Canvas coordinate inverse");
   checks.push("sample/second/quarter and canvas mappings");
+  host({ type: "ready", onnx: false, asio: true, verovio: false });
+  require(!$("polyphonic").disabled, "Offline polyphonic DSP must remain available without ONNX");
+  $("polyphonic").checked = true;
+  $("polyphonic").dispatchEvent(new studio.Event("change", { bubbles: true }));
+  require($("model-status").textContent.includes("spectral"),
+    "Offline polyphonic selection did not identify its actual DSP backend");
+  $("polyphonic").checked = false;
+  $("polyphonic").dispatchEvent(new studio.Event("change", { bubbles: true }));
   host({ type: "ready", onnx: true, asio: true, verovio: false });
   host({ type: "asio-devices", devices: [{ id: 0, name: "Test ASIO", default: true,
     channels: 2, sample_rates: [44100, 48000], preferred_sample_rate: 48000 }] });
@@ -336,12 +344,36 @@ window.runTranscriberWorkflowTests = async (studio) => {
   const metadata = { score_id: "workflow", score_revision: 1, tempo: 120, tempo_inferred: true,
     time_numerator: 4, time_denominator: 4, key_fifths: 0, tempo_map: map, source_sample_rate: 48000 };
   const notes = [
-    { id: "one", midi: 64, name: "E4", start: 0, duration: .5, amplitude: .2 },
-    { id: "two", midi: 69, name: "A4", start: 1, duration: .5, amplitude: .2 },
+    { id: "one", midi: 64, name: "E4", start: 0, duration: .5, amplitude: .2,
+      confidence_assessment: { band: "low", evidence_score: .35, calibrated_probability: null,
+        reasons: ["sparse-temporal-evidence"] } },
+    { id: "two", midi: 69, name: "A4", start: 1, duration: .5, amplitude: .2,
+      calibrated_confidence: .9,
+      confidence_assessment: { band: "high", evidence_score: .7, calibrated_probability: .9,
+        reasons: [] } },
   ];
+  const confidenceSummary = { note_count: 2, assessed_notes: 2, calibrated_notes: 1,
+    low_notes: 1, mean_evidence_score: .525, mean_calibrated_probability: .9 };
+  metadata.confidence_report = { version: 1, transcription: confidenceSummary,
+    phrases: [{ start_seconds: 0, end_seconds: 1.5, note_ids: ["one", "two"],
+      summary: confidenceSummary }] };
   host({ type: "complete", success: true, notes, metadata, fingering: {
     notes: [{ string: 1, fret: 0, candidates: [] }, { string: 1, fret: 5, candidates: [] }],
-  }, summary: "fixture" });
+  }, summary: "fixture", chords: [{ onset_seconds: .25, name: "C/E" }],
+    polyphonic_diagnostics: { refused_note_starts: 2 } });
+  require($("note-list").querySelector('[data-confidence-band="low"]') &&
+    $("note-list").textContent.includes("score 0.35") &&
+    $("note-list").textContent.includes("90% calibrated") &&
+    $("note-list").querySelector('[data-confidence-band="low"]').getAttribute("aria-label").includes("LOW"),
+    "Confidence labels, low-note visualization or accessible uncertainty labels are missing");
+  require($("confidence-summary").textContent.includes("assessed 2/2") &&
+    $("confidence-summary").textContent.includes("heuristic") &&
+    $("phrase-confidence").children.length === 1,
+    "Transcription/phrase means and assessment coverage were not rendered");
+  checks.push("explicit note evidence versus calibrated probability, low-note markers and phrase/transcription summaries");
+  require($("result-message").textContent.includes("0.25s C/E") &&
+    $("result-message").textContent.includes("2 note-start"),
+    "Named chords or capacity diagnostics were not rendered in the workstation");
   $("record-button").click();
   host({ type: "live-status", version: 1, job: 2, state: "capturing",
     status: "Recording; live analysis active" });
@@ -356,7 +388,10 @@ window.runTranscriberWorkflowTests = async (studio) => {
     "A new live capture did not render on top of the existing accepted score");
   host({ type: "live-status", version: 1, job: 2, state: "finished",
     status: "Capture finished" });
-  host({ type: "proposal", success: true, accepted_revision: 1, notes: [retakeNote] });
+  host({ type: "proposal", success: true, accepted_revision: 1, notes: [retakeNote],
+    chords: [{ onset_seconds: .5, name: "Am" }] });
+  require($("result-message").textContent.includes("0.50s Am"),
+    "Analysis proposals did not display their detected harmony");
   require($("note-list").textContent.includes("E4") &&
     $("note-list").textContent.includes("A4") &&
     !$("note-list").textContent.includes("F4"),
@@ -371,6 +406,9 @@ window.runTranscriberWorkflowTests = async (studio) => {
   require($("edit-duration").value === "0.50", "Failed transaction did not roll back");
   key("ArrowUp");
   require($("edit-pitch").value === "65", "Pitch keyboard edit");
+  require($("note-list").textContent.includes("USER EDIT") &&
+    $("confidence-summary").textContent.includes("Pending edits"),
+    "Edited notes retained detector confidence or stale aggregate confidence");
   require($("fingering-alternatives").textContent.includes("Unresolved"), "Pitch edit did not clear stale tablature");
   $("undo-button").click();
   require($("edit-pitch").value === "64", "Undo pitch/selection");
@@ -576,6 +614,53 @@ window.runTranscriberWorkflowTests = async (studio) => {
   $("undo-button").click();
   require($("note-list").querySelectorAll(".note-row").length === 2, "Undo split");
   checks.push("transactional split, merge and undo across notation and tablature");
+
+  host({ type: "complete", success: true, notes,
+    metadata: { ...metadata, score_id: "correction-workflow", score_revision: 1 },
+    fingering: { notes: [{ string: 1, fret: 0 }, { string: 1, fret: 5 }] },
+    summary: "correction workflow" });
+  send("engraving-select", { id: "one" });
+  $("accept-note").click();
+  $("edit-pitch").value = "65";
+  $("edit-start").value = "0.10";
+  $("edit-duration").value = "0.55";
+  $("apply-note-edit").click();
+  $("undo-button").click();
+  require($("edit-pitch").value === "64", "Undo did not restore pending pitch edits");
+  $("redo-button").click();
+  require($("edit-pitch").value === "65", "Redo did not restore pending pitch edits");
+  $("split-note").click();
+  $("merge-note").click();
+  send("engraving-select", { id: "two" });
+  $("delete-note").click();
+  $("export-edits").click();
+  const correctionRequest = studio.__messages.filter(
+    message => message.startsWith("export-edits|")).at(-1);
+  const correctionFields = new URLSearchParams(correctionRequest.split("|")[1]);
+  const correctionActions = correctionFields.get("score_actions").split(";");
+  require(correctionActions.includes("accept,one") &&
+    correctionActions.some(action => action.startsWith("pitch,one,65")) &&
+    correctionActions.some(action => action.startsWith("timing,one,")) &&
+    correctionActions.some(action => action.startsWith("split,one,user-")) &&
+    correctionActions.some(action => action.startsWith("merge,one,user-")) &&
+    correctionActions.includes("reject,two") &&
+    Number(correctionFields.get("score_action_sequence")) > 0,
+    `Canonical correction actions were not serialized: ${correctionFields.get("score_actions")}`);
+  const committedSequence = Number(correctionFields.get("score_action_sequence"));
+  host({ type: "project-autosaving", score_revision: 2, generation: 1,
+    score_action_sequence: committedSequence });
+  host({ type: "exported", success: false, error: "Keep correction draft open" });
+  $("export-edits").click();
+  const afterAutosaveRequest = studio.__messages.filter(
+    message => message.startsWith("export-edits|")).at(-1);
+  const afterAutosaveFields = new URLSearchParams(afterAutosaveRequest.split("|")[1]);
+  require(afterAutosaveFields.get("score_actions") === "" &&
+    afterAutosaveFields.get("score_action_sequence") === "0" &&
+    afterAutosaveFields.get("base_revision") === "2",
+    "Autosave acknowledgement did not clear only the committed correction actions");
+  host({ type: "exported", success: false, error: "Finish correction workflow test" });
+  checks.push("accept/reject, pitch/timing, split/merge correction persistence and autosave sequence acknowledgement");
+
   await tick();
   const beforePaint = ["waveform", "spectrogram", "staff-view", "tab-view", "piano-roll"]
     .map(id => Number($(id).dataset.paintCount));

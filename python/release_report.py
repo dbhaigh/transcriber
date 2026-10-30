@@ -347,7 +347,7 @@ def create_report(args) -> dict:
     )
     status = "blocked" if failed else "pending" if required_pending else "ready"
     qualified_providers = sorted(providers)
-    if not any(provider in ("cuda", "directml", "rocm") for provider in qualified_providers):
+    if not any(provider in ("cuda", "directml", "rocm", "tensorrt") for provider in qualified_providers):
         limitations.append(
             "No accelerator provider has a matching quality report; GPU provider performance is unqualified.")
     return {

@@ -9,10 +9,11 @@ to the document rather than kept only in a view.
 
 ## Time and pitch
 
-`schema_version` is currently `1`. Source events are retained separately from
-score notes. Their onset and offset are recording-relative seconds, and their
-sample positions refer to the source sample rate recorded by the document.
-Interpretation does not overwrite these measurements.
+`schema_version` is currently `2`; schema 1 remains readable and is preserved
+until an edit requires schema-2 correction data. Source events are retained
+separately from score notes. Their onset and offset are recording-relative
+seconds, and their sample positions refer to the source sample rate recorded
+by the document. Interpretation does not overwrite these measurements.
 
 Each `ScoreNote` links to its source event IDs and stores measured audio
 onset/offset beside interpreted onset and duration in quarter-note units.
@@ -37,7 +38,8 @@ reentrant tunings. Optional `physical_fret_count` constrains capo plus relative
 fret; it is serialized as a nullable additive schema-1 field. Older schema-1
 projects without the field retain the previous unknown-neck-length behavior.
 Unknown assignments remain unassigned. Tablature positions are suggestions,
-not evidence of the exact fingering used in the recording.
+not evidence of the exact fingering used in the recording. Explicit note
+acceptance is stored separately from manual authorship.
 
 ## Revisions and editing
 
@@ -54,15 +56,25 @@ reason, command ID, and origin. Undo and redo restore snapshots as new
 revisions, and the bounded history retains at most 100 undo snapshots. Stale
 transactions are rejected rather than silently applied to a different score.
 
+Schema 2 also stores a correction journal for note acceptance/rejection,
+manual insertion/deletion, pitch and timing changes, splits, and merges. Each
+record links before/after note snapshots to their source-event IDs and retains
+measured audio boundaries beside corrected quarter and second positions.
+Detector events and raw evidence remain unchanged. Undo marks the affected
+correction records inactive; redo reactivates them, so downstream training
+workflows can exclude reverted edits without losing their audit trail.
+
 ## Serialization and migration
 
 `serialize_score_document` writes schema-versioned JSON. Deserialization
 validates the schema, IDs and relationships, pitches, timing, instrument
 settings, evidence, tie groups, and revision history. The parser is
 dependency-free, limits input to 64 MiB, and rejects malformed or unsupported
-future schemas. Version-0 flat-note projects migrate to schema 1 with migration
+future schemas. Version-0 flat-note projects migrate to schema 2 with migration
 provenance; migration cannot reconstruct musical interpretation or source
-evidence that was not present in the old project.
+evidence that was not present in the old project. Schema-1 documents retain
+their canonical serialization for project-integrity checks; their first
+correction-bearing edit upgrades them to schema 2.
 
 The CLI option `--score-project <path>` writes this canonical project. The
 existing `--json` output remains the compatibility-oriented raw detection

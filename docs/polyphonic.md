@@ -1,5 +1,10 @@
 # Polyphonic activation and model adapters
 
+For the newer opt-in note lifecycle and named-chord pipeline, model comparison,
+CLI/workstation integration and qualification limits, see
+[Tracked polyphonic transcription](polyphonic-pipeline.md). The measurements
+below characterize the pre-existing adapter alternatives, not the new tracker.
+
 The fast monophonic YIN path is unchanged. Model-free builds remain supported.
 The existing spectral decoder and Basic Pitch stitching remain the defaults;
 the new alternatives are explicit opt-ins. In particular, **the competing

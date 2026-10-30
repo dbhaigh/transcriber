@@ -5,6 +5,7 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+import wave
 from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
 
@@ -111,7 +113,7 @@ def exports(directory):
     assert len((directory / "transcription.txt").read_text(encoding="utf-8")) > 20
 
 
-def webview(executable, audio, directory):
+def webview(executable, audio, directory, polyphonic=False):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -138,12 +140,15 @@ def webview(executable, audio, directory):
           return !guide.hidden && !document.getElementById('instrument-prior').closest('details');
         })()"""), "Actual host did not expose first-run setup"
         values = {"input-path": str(audio), "model-path": "", "musicxml-path": str(directory / "transcription.musicxml"),
-                  "tab-path": str(directory / "transcription.txt"), "midi-path": str(directory / "transcription.mid")}
+                  "tab-path": str(directory / "transcription.txt"), "midi-path": str(directory / "transcription.mid"),
+                  "json-path": str(directory / "transcription.score.json")}
         connection.evaluate(f"""(() => {{
           for (const [id, value] of Object.entries({json.dumps(values)}))
             document.getElementById(id).value = value;
           document.getElementById('instrument-prior').value = 'guitar';
           document.getElementById('quality-mode').value = 'quality';
+          document.getElementById('polyphonic').checked = {json.dumps(polyphonic)};
+          document.getElementById('polyphonic').dispatchEvent(new Event('change', {{bubbles:true}}));
           document.getElementById('transcribe-button').click();
         }})()""")
         until(lambda: connection.evaluate("""(() => {
@@ -154,6 +159,27 @@ def webview(executable, audio, directory):
             document.querySelectorAll('.note-row').length > 0;
         })()"""))
         exports(directory)
+        if polyphonic:
+            assert connection.evaluate("""(() => {
+              const text = document.getElementById('result-message').textContent;
+              return text.includes('Detected harmony (heuristic)') &&
+                /[0-9.]+s C(?:,|\\s|$)/.test(text);
+            })()"""), "Actual workstation did not display detected C-major harmony"
+            assert connection.evaluate("""(() => {
+              const summary = document.getElementById('confidence-summary').textContent;
+              const rows = [...document.querySelectorAll('.note-row')];
+              return /assessed \\d+\\/\\d+/.test(summary) && summary.includes('(heuristic)') &&
+                document.querySelectorAll('#phrase-confidence li').length > 0 &&
+                rows.every(row => ['high', 'medium', 'low', 'unassessed', 'user-edited']
+                  .includes(row.dataset.confidenceBand));
+            })()"""), "Actual workstation did not render note, phrase and transcription confidence"
+            score = json.loads((directory / "transcription.score.json").read_text(encoding="utf-8"))
+            sources = score["source_events"]
+            assert {round(event["midi_pitch"]) for event in sources} == {60, 64, 67}
+            assert all(event["source_model"] == "builtin:spectral" for event in sources)
+            assert all(event["offset_sample"] > event["onset_sample"] for event in sources)
+            print("Actual WebView2 polyphonic pipeline: C/E/G notes, named C-major harmony, confidence views, canonical evidence and exports passed")
+            return
         if connection.evaluate("Boolean(window.transcribeConfig.verovio)"):
             until(lambda: connection.evaluate("""(() => {
               const status = document.getElementById('engraving-status').textContent;
@@ -169,6 +195,7 @@ def webview(executable, audio, directory):
         })()"""), "Actual engine did not publish completed state/frequency metadata"
         assert connection.evaluate("""(() => {
           document.querySelector('.note-row').click();
+          document.getElementById('accept-note').click();
           document.getElementById('edit-pitch').value = '70';
           document.getElementById('apply-note-edit').click();
           return document.getElementById('detected-pitch').textContent.includes('70');
@@ -183,6 +210,18 @@ def webview(executable, audio, directory):
           document.getElementById('close-help').click();
           return dirty && undo && help && document.getElementById('edit-pitch').value === '70';
         })()"""), "Actual-host unsaved/undo/redo/help journey failed"
+        assert connection.evaluate("""(() => {
+          const before = document.querySelectorAll('.note-row').length;
+          document.getElementById('split-note').click();
+          const split = document.querySelectorAll('.note-row').length === before + 1;
+          document.getElementById('merge-note').click();
+          if (!split || document.querySelectorAll('.note-row').length !== before) return false;
+          const duration = Number(document.getElementById('edit-duration').value);
+          const correctedDuration = Math.round((duration - .01) * 100) / 100;
+          document.getElementById('edit-duration').value = correctedDuration.toFixed(2);
+          document.getElementById('apply-note-edit').click();
+          return Number(document.getElementById('edit-duration').value) === correctedDuration;
+        })()"""), "Actual-host split/merge correction journey failed"
         connection.evaluate("document.getElementById('export-edits').click()")
         until(lambda: connection.evaluate("document.getElementById('export-edits').textContent.includes('Exported')"))
         xml = ET.parse(directory / "transcription.musicxml")
@@ -199,6 +238,17 @@ def webview(executable, audio, directory):
           {{detail:{{path:{json.dumps(str(project))},scoreOnly:false}}}}))""")
         until(lambda: project.is_file() and connection.evaluate(
             "document.getElementById('save-state').textContent === 'No unsaved edits'"))
+        saved_score = json.loads(project.read_text(encoding="utf-8"))["score"]
+        correction_operations = {
+            correction["operation"] for correction in saved_score.get("corrections", [])
+        }
+        assert {"accepted", "pitch-adjusted", "timing-adjusted", "split", "merged"} <= correction_operations, \
+            f"Canonical correction journal omitted an editor operation: {correction_operations}"
+        assert all(
+            snapshot["source_event_ids"]
+            for correction in saved_score["corrections"]
+            for snapshot in correction["before"] + correction["after"]
+        ), "Canonical corrections lost source-event links"
         connection.evaluate(f"""window.chrome.webview.postMessage('open-project|' +
           new URLSearchParams({{path:{json.dumps(str(project))}}}).toString())""")
         until(lambda: connection.evaluate(
@@ -206,6 +256,7 @@ def webview(executable, audio, directory):
         assert connection.evaluate("""(() => {
           document.querySelector('.note-row').click();
           return document.getElementById('edit-pitch').value === '70' &&
+            document.getElementById('accept-note').textContent === 'Accepted' &&
             document.getElementById('project-annotation').value === 'Reviewed guitar phrase.' &&
             document.getElementById('quantization-mode').value === 'evidence' &&
             document.getElementById('quantization-strength').value === '0.35';
@@ -318,6 +369,8 @@ def webview(executable, audio, directory):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--webview", type=Path, required=True)
+    parser.add_argument("--polyphonic", action="store_true",
+                        help="exercise the tracked DSP/chord path on generated overlapping notes")
     args = parser.parse_args()
     if os.name != "nt":
         return 77
@@ -326,7 +379,21 @@ def main():
     try:
         directory = Path(temporary.name) / "Unicode \u00e9 output"
         directory.mkdir()
-        webview(args.webview.resolve(), audio, directory)
+        if args.polyphonic:
+            audio = directory / "overlapping-chord.wav"
+            rate = 22050
+            with wave.open(str(audio), "wb") as output:
+                output.setparams((1, 2, rate, 0, "NONE", "not compressed"))
+                samples = bytearray()
+                for frame in range(rate * 2):
+                    time_seconds = frame / rate
+                    value = sum(
+                        .2 * math.sin(2 * math.pi * 440 * 2 ** ((pitch - 69) / 12) * time_seconds)
+                        for pitch, start, end in ((60, .2, 1.6), (64, .2, 1.1), (67, .5, 1.4))
+                        if start <= time_seconds < end)
+                    samples.extend(struct.pack("<h", round(value * 32767)))
+                output.writeframes(samples)
+        webview(args.webview.resolve(), audio, directory, args.polyphonic)
     finally:
         def cleanup():
             try:

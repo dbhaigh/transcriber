@@ -143,6 +143,19 @@ TEST_CASE("version one project wrappers explicitly migrate to current settings",
         transcribe::serialize_project_document(project)));
 }
 
+TEST_CASE("version two project integrity preserves nested score schema one",
+          "[project][migration][serialization]") {
+    auto project = sample_project();
+    project.score.schema_version = transcribe::legacy_score_schema_version;
+    const auto serialized = transcribe::serialize_project_document(project);
+    REQUIRE(serialized.find("\"score\":{\"schema_version\":1") !=
+            std::string::npos);
+    const auto restored = transcribe::deserialize_project_document(serialized);
+    REQUIRE(restored.score.schema_version ==
+            transcribe::legacy_score_schema_version);
+    REQUIRE(transcribe::serialize_project_document(restored) == serialized);
+}
+
 TEST_CASE("project integrity rejects valid JSON with corrupted musical metadata",
           "[project][validation]") {
     auto json = transcribe::serialize_project_document(sample_project());
@@ -335,6 +348,22 @@ TEST_CASE("versioned projects round trip score, audio, configuration and exports
     REQUIRE(restored.score.history.size() == original.score.history.size());
     REQUIRE(restored.score.history.back().reason ==
             original.score.history.back().reason);
+}
+
+TEST_CASE("project export records preserve canonical score JSON output",
+          "[project][validation][serialization]") {
+    auto project = sample_project();
+    project.exports = {{
+        "json", "fixture.score.json", project.score.revision, true, {}}};
+
+    const auto restored = transcribe::deserialize_project_document(
+        transcribe::serialize_project_document(project));
+    REQUIRE(restored.exports.size() == 1);
+    REQUIRE(restored.exports.front().format == "json");
+    REQUIRE(restored.exports.front().path == "fixture.score.json");
+
+    project.exports.front().format = "unknown";
+    REQUIRE_THROWS(transcribe::validate_project_document(project));
 }
 
 TEST_CASE("legacy score-only documents migrate to an explicit linked project",

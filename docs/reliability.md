@@ -27,7 +27,7 @@ Smallest release-contract selection:
 ctest --test-dir build-release --output-on-failure `
   -R "cli_export_validation|atomic.exports|dependency_manifest_smoke|interpretation_semantics|fingering_export_semantics|ui_workflow_browser"
 cpack --config build-release\CPackConfig.cmake -G ZIP -B build-release\packages
-python tests\package_smoke.py build-release\packages\transcriber-0.1.6-win64.zip --isolated-runtime
+python tests\package_smoke.py build-release\packages\transcriber-0.1.9-win64.zip --isolated-runtime
 ```
 
 `--expect-model`, `--expect-webview2`, `--expect-verovio`, `--expect-ffmpeg`

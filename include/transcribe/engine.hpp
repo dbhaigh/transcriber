@@ -1,6 +1,7 @@
 #pragma once
 
 #include "transcribe/live.hpp"
+#include "transcribe/polyphonic_pipeline.hpp"
 
 namespace transcribe {
 
@@ -42,6 +43,8 @@ struct EngineConfiguration {
     InferenceRequest inference;
     // Unset preserves the existing adapter's segmentation and legacy Note results.
     std::optional<TemporalDecodingOptions> segmentation;
+    // Explicit finite-recording pipeline; incompatible with live begin()/legacy segmentation.
+    std::optional<PolyphonicDecodingOptions> polyphonic_decoding;
 };
 
 struct EngineProvenance {
@@ -87,6 +90,7 @@ struct EngineUpdate {
     // Includes retractions, gap markers, revisions and overflow-resync semantics.
     std::optional<live::EventBatch> live_changes;
     bool finished{};
+    std::optional<PolyphonicTranscription> polyphonic;
 };
 
 struct EngineDiagnostics {
@@ -155,6 +159,7 @@ struct EngineRequirements {
     bool activations{};
     bool model_onsets{};
     OnnxExecutionProvider provider{OnnxExecutionProvider::Cpu};
+    bool allow_cpu_fallback{};
 };
 
 struct EngineAvailability {

@@ -18,7 +18,7 @@ InferenceResult<FileInferenceResult> infer_wav_file(
             contract != ModelContract::BasicPitchV1) {
             return InferenceError{InferenceErrorCode::Unsupported,
                 "Bounded file inference supports built-in trackers and BasicPitchV1 only; "
-                "LegacyPitchV1 requires a complete waveform"};
+                "LegacyPitchV1 and custom contracts require a complete waveform or an adapter-specific bounded path"};
         }
         if (!backend.resources().loaded) {
             return InferenceError{InferenceErrorCode::NotLoaded, "Load the backend before file inference"};

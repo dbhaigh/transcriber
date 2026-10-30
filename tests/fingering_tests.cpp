@@ -367,6 +367,38 @@ TEST_CASE("fingering candidates preserve sounding pitch across supported tunings
     }
 }
 
+TEST_CASE("alternate-tuning capo solutions keep pitch across ranked phrase candidates",
+          "[fingering][guitar]") {
+    transcribe::FingeringOptions options;
+    options.string_tuning = {62, 57, 55, 50, 45, 38};
+    options.capo_fret = 2;
+    options.physical_fret_count = 24;
+    options.maximum_alternatives = 5;
+    const std::vector<transcribe::Note> notes{
+        {64, 0.0, 0.2, "E4", 0.9}, {67, 0.3, 0.2, "G4", 0.9},
+        {69, 0.6, 0.2, "A4", 0.9}, {71, 0.9, 0.2, "B4", 0.9}};
+
+    const auto result = transcribe::assign_fingerings(notes, options);
+
+    REQUIRE(result.fully_playable);
+    REQUIRE(result.alternatives.size() == options.maximum_alternatives);
+    REQUIRE(result.cost.unassigned_notes == Catch::Approx(0.0));
+    REQUIRE(std::isfinite(result.cost.hand_movement));
+    REQUIRE(std::isfinite(result.cost.chord_stretch));
+    transcribe::validate_fingering_assignment(notes, result.positions, options);
+    for (const auto& alternative : result.alternatives) {
+        transcribe::validate_fingering_assignment(notes, alternative.positions, options);
+    }
+    for (std::size_t index = 0; index < result.notes.size(); ++index) {
+        REQUIRE(result.notes[index].playable_positions.size() > 1);
+        for (const auto& position : result.notes[index].playable_positions) {
+            REQUIRE(options.string_tuning[position.string_number - 1] +
+                        options.capo_fret + position.fret ==
+                    notes[index].midi_pitch);
+        }
+    }
+}
+
 TEST_CASE("enharmonic pitches and octave boundaries are assigned by MIDI pitch") {
     const std::vector<transcribe::Note> notes{
         {61, 0.0, 0.3, "C-sharp or D-flat", 0.9},

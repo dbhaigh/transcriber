@@ -92,12 +92,123 @@ void mark_user_edit(ScoreNote& note, const ScoreTransaction& transaction,
                        transaction.reason, transaction.command_id};
 }
 
+void mark_user_decision(ScoreNote& note, const ScoreTransaction& transaction,
+                        std::uint64_t revision) {
+    note.revision = revision;
+    note.provenance = {ScoreEditOrigin::User, transaction.actor,
+                       transaction.reason, transaction.command_id};
+}
+
 void mark_user_edit(ScoreRest& rest, const ScoreTransaction& transaction,
                     std::uint64_t revision) {
     rest.user_authored = true;
     rest.revision = revision;
     rest.provenance = {ScoreEditOrigin::User, transaction.actor,
                        transaction.reason, transaction.command_id};
+}
+
+std::string correction_kind_name(ScoreCorrectionKind kind) {
+    switch (kind) {
+    case ScoreCorrectionKind::Accepted: return "accepted";
+    case ScoreCorrectionKind::Rejected: return "rejected";
+    case ScoreCorrectionKind::Inserted: return "inserted";
+    case ScoreCorrectionKind::Deleted: return "deleted";
+    case ScoreCorrectionKind::PitchAdjusted: return "pitch-adjusted";
+    case ScoreCorrectionKind::TimingAdjusted: return "timing-adjusted";
+    case ScoreCorrectionKind::Split: return "split";
+    case ScoreCorrectionKind::Merged: return "merged";
+    }
+    throw std::invalid_argument("Unknown score correction operation.");
+}
+
+ScoreCorrectionKind parse_correction_kind(std::string_view value) {
+    if (value == "accepted") return ScoreCorrectionKind::Accepted;
+    if (value == "rejected") return ScoreCorrectionKind::Rejected;
+    if (value == "inserted") return ScoreCorrectionKind::Inserted;
+    if (value == "deleted") return ScoreCorrectionKind::Deleted;
+    if (value == "pitch-adjusted") return ScoreCorrectionKind::PitchAdjusted;
+    if (value == "timing-adjusted") return ScoreCorrectionKind::TimingAdjusted;
+    if (value == "split") return ScoreCorrectionKind::Split;
+    if (value == "merged") return ScoreCorrectionKind::Merged;
+    throw std::invalid_argument("Score document contains an unknown correction operation.");
+}
+
+ScoreCorrectionNoteSnapshot correction_snapshot(const ScoreDocument& document,
+                                                const ScoreNote& note) {
+    return {
+        note.id,
+        note.source_event_ids,
+        note.sounding_midi_pitch,
+        note.measured_onset_seconds,
+        note.measured_offset_seconds,
+        score_position_seconds(document, note.onset_quarters),
+        score_position_seconds(
+            document, note.onset_quarters + note.duration_quarters),
+        note.onset_quarters,
+        note.duration_quarters,
+        note.user_authored,
+        note.user_accepted,
+    };
+}
+
+struct ScoreCorrectionShape {
+    ScoreCorrectionKind operation;
+    std::vector<std::string> before_note_ids;
+    std::vector<std::string> after_note_ids;
+};
+
+std::optional<ScoreCorrectionShape> correction_shape(
+    const ScoreDocument& document, const ScoreEditCommand& command) {
+    return std::visit([&](const auto& operation)
+        -> std::optional<ScoreCorrectionShape> {
+        using Operation = std::decay_t<decltype(operation)>;
+        if constexpr (std::is_same_v<Operation, InsertScoreNote>) {
+            return ScoreCorrectionShape{
+                ScoreCorrectionKind::Inserted, {}, {operation.note.id}};
+        } else if constexpr (std::is_same_v<Operation, DeleteScoreElement>) {
+            if (find_note(document, operation.element_id) == nullptr) return std::nullopt;
+            return ScoreCorrectionShape{
+                ScoreCorrectionKind::Deleted, {operation.element_id}, {}};
+        } else if constexpr (std::is_same_v<Operation, AcceptScoreNote>) {
+            return ScoreCorrectionShape{
+                ScoreCorrectionKind::Accepted, {operation.note_id}, {operation.note_id}};
+        } else if constexpr (std::is_same_v<Operation, RejectScoreNote>) {
+            return ScoreCorrectionShape{
+                ScoreCorrectionKind::Rejected, {operation.note_id}, {}};
+        } else if constexpr (std::is_same_v<Operation, ChangeScorePitch>) {
+            return ScoreCorrectionShape{
+                ScoreCorrectionKind::PitchAdjusted, {operation.note_id}, {operation.note_id}};
+        } else if constexpr (std::is_same_v<Operation, ChangeScoreDuration> ||
+                             std::is_same_v<Operation, ReinterpretScoreRhythm>) {
+            return ScoreCorrectionShape{
+                ScoreCorrectionKind::TimingAdjusted,
+                {operation.note_id}, {operation.note_id}};
+        } else if constexpr (std::is_same_v<Operation, SplitScoreNote>) {
+            return ScoreCorrectionShape{
+                ScoreCorrectionKind::Split,
+                {operation.note_id},
+                {operation.note_id, operation.second_note_id}};
+        } else if constexpr (std::is_same_v<Operation, MergeScoreNotes>) {
+            return ScoreCorrectionShape{
+                ScoreCorrectionKind::Merged,
+                {operation.first_note_id, operation.second_note_id},
+                {operation.merged_note_id}};
+        } else {
+            return std::nullopt;
+        }
+    }, command);
+}
+
+std::vector<ScoreCorrectionNoteSnapshot> correction_snapshots(
+    const ScoreDocument& document, const std::vector<std::string>& note_ids) {
+    std::vector<ScoreCorrectionNoteSnapshot> snapshots;
+    snapshots.reserve(note_ids.size());
+    for (const auto& id : note_ids) {
+        if (const auto* note = find_note(document, id)) {
+            snapshots.push_back(correction_snapshot(document, *note));
+        }
+    }
+    return snapshots;
 }
 
 void validate_rhythm(const RhythmValue& rhythm) {
@@ -208,6 +319,28 @@ void apply_command(ScoreDocument& document, const ScoreEditCommand& command,
                 throw std::invalid_argument("Unknown score element ID: " + operation.element_id);
             }
             document.rests.erase(rest);
+        } else if constexpr (std::is_same_v<Operation, AcceptScoreNote>) {
+            auto* note = find_note(document, operation.note_id);
+            if (note == nullptr) {
+                throw std::invalid_argument(
+                    "Unknown score note ID: " + operation.note_id);
+            }
+            if (note->user_accepted) {
+                throw std::invalid_argument("Score note is already accepted.");
+            }
+            note->user_accepted = true;
+            mark_user_decision(*note, transaction, next_revision);
+        } else if constexpr (std::is_same_v<Operation, RejectScoreNote>) {
+            const auto note = std::find_if(document.notes.begin(), document.notes.end(),
+                [&](const auto& candidate) { return candidate.id == operation.note_id; });
+            if (note == document.notes.end()) {
+                throw std::invalid_argument(
+                    "Unknown score note ID: " + operation.note_id);
+            }
+            document.notes.erase(note);
+            std::erase_if(document.tab_notes, [&](const auto& tab) {
+                return tab.notation_note_id == operation.note_id;
+            });
         } else if constexpr (std::is_same_v<Operation, ChangeScorePitch>) {
             auto* note = find_note(document, operation.note_id);
             if (note == nullptr) throw std::invalid_argument("Unknown score note ID: " + operation.note_id);
@@ -266,9 +399,9 @@ void apply_command(ScoreDocument& document, const ScoreEditCommand& command,
             }
             ensure_identifier_available(document, operation.second_note_id);
             const auto original_duration = note->duration_quarters;
-            const auto tie_id = transaction.command_id.empty()
-                ? stable_id("tie-", note->id + std::to_string(next_revision))
-                : transaction.command_id + "-tie";
+            const auto tie_id = stable_id(
+                "tie-", transaction.command_id + ":" + note->id + ":" +
+                    operation.second_note_id + ":" + std::to_string(next_revision));
             ScoreNote second = *note;
             second.id = operation.second_note_id;
             second.onset_quarters += operation.first_duration_quarters;
@@ -302,15 +435,20 @@ void apply_command(ScoreDocument& document, const ScoreEditCommand& command,
             if (right->onset_quarters < left->onset_quarters) std::swap(left, right);
             if (left->voice != right->voice ||
                 left->sounding_midi_pitch != right->sounding_midi_pitch ||
-                std::abs(left->onset_quarters + left->duration_quarters -
-                         right->onset_quarters) > 1e-6) {
+                right->onset_quarters <
+                    left->onset_quarters + left->duration_quarters - 1e-6) {
                 throw std::invalid_argument(
-                    "Only adjacent notes with the same pitch and voice can be merged.");
+                    "Only non-overlapping notes with the same pitch and voice can be merged.");
             }
-            ensure_identifier_available(document, operation.merged_note_id);
+            if (operation.merged_note_id != first.id &&
+                operation.merged_note_id != second.id) {
+                ensure_identifier_available(document, operation.merged_note_id);
+            }
             ScoreNote merged = *left;
             merged.id = operation.merged_note_id;
-            merged.duration_quarters += right->duration_quarters;
+            merged.duration_quarters =
+                right->onset_quarters + right->duration_quarters -
+                left->onset_quarters;
             merged.rhythm.duration_quarters = merged.duration_quarters;
             merged.measured_onset_seconds = std::min(first.measured_onset_seconds,
                                                        second.measured_onset_seconds);
@@ -325,6 +463,7 @@ void apply_command(ScoreDocument& document, const ScoreEditCommand& command,
             merged.tie_group_id.reset();
             merged.tie_start = false;
             merged.tie_stop = false;
+            merged.user_accepted = first.user_accepted && second.user_accepted;
             mark_user_edit(merged, transaction, next_revision);
             document.notes.erase(std::remove_if(document.notes.begin(), document.notes.end(),
                 [&](const auto& candidate) {
@@ -1046,7 +1185,54 @@ ScoreEditProvenance read_provenance(const JsonValue& value) {
             string(field(fields, "command_id"), "command_id")};
 }
 
-ScoreNote read_note(const JsonValue& value) {
+ScoreCorrectionNoteSnapshot read_correction_snapshot(const JsonValue& value) {
+    const auto& fields = object(value, "correction note snapshot");
+    ScoreCorrectionNoteSnapshot result;
+    result.note_id = string(field(fields, "note_id"), "note_id");
+    for (const auto& source_id :
+         array(field(fields, "source_event_ids"), "source_event_ids")) {
+        result.source_event_ids.push_back(string(source_id, "source_event_id"));
+    }
+    result.sounding_midi_pitch =
+        int_value(field(fields, "sounding_midi_pitch"), "sounding_midi_pitch");
+    result.measured_onset_seconds =
+        number(field(fields, "measured_onset_seconds"), "measured_onset_seconds");
+    result.measured_offset_seconds =
+        number(field(fields, "measured_offset_seconds"), "measured_offset_seconds");
+    result.corrected_onset_seconds =
+        number(field(fields, "corrected_onset_seconds"), "corrected_onset_seconds");
+    result.corrected_offset_seconds =
+        number(field(fields, "corrected_offset_seconds"), "corrected_offset_seconds");
+    result.onset_quarters =
+        number(field(fields, "onset_quarters"), "onset_quarters");
+    result.duration_quarters =
+        number(field(fields, "duration_quarters"), "duration_quarters");
+    result.user_authored = boolean(field(fields, "user_authored"), "user_authored");
+    result.user_accepted = boolean(field(fields, "user_accepted"), "user_accepted");
+    return result;
+}
+
+ScoreCorrection read_correction(const JsonValue& value) {
+    const auto& fields = object(value, "score correction");
+    ScoreCorrection result;
+    result.id = string(field(fields, "id"), "id");
+    result.operation = parse_correction_kind(
+        string(field(fields, "operation"), "operation"));
+    result.revision = uint64_value(field(fields, "revision"), "revision");
+    result.actor = string(field(fields, "actor"), "actor");
+    result.reason = string(field(fields, "reason"), "reason");
+    result.command_id = string(field(fields, "command_id"), "command_id");
+    result.active = boolean(field(fields, "active"), "active");
+    for (const auto& item : array(field(fields, "before"), "before")) {
+        result.before.push_back(read_correction_snapshot(item));
+    }
+    for (const auto& item : array(field(fields, "after"), "after")) {
+        result.after.push_back(read_correction_snapshot(item));
+    }
+    return result;
+}
+
+ScoreNote read_note(const JsonValue& value, std::uint32_t schema_version) {
     const auto& fields = object(value, "score note");
     ScoreNote result;
     result.id = string(field(fields, "id"), "id");
@@ -1083,6 +1269,10 @@ ScoreNote read_note(const JsonValue& value) {
     result.tie_start = boolean(field(fields, "tie_start"), "tie_start");
     result.tie_stop = boolean(field(fields, "tie_stop"), "tie_stop");
     result.user_authored = boolean(field(fields, "user_authored"), "user_authored");
+    if (schema_version >= score_schema_version) {
+        result.user_accepted =
+            boolean(field(fields, "user_accepted"), "user_accepted");
+    }
     result.revision = uint64_value(field(fields, "revision"), "revision");
     result.provenance = read_provenance(field(fields, "provenance"));
     return result;
@@ -1177,7 +1367,7 @@ ScoreDocument read_current_document(const JsonValue::Object& fields) {
         result.uncertainties.push_back(string(item, "uncertainty"));
     }
     for (const auto& item : array(field(fields, "notes"), "notes")) {
-        result.notes.push_back(read_note(item));
+        result.notes.push_back(read_note(item, result.schema_version));
     }
     for (const auto& item : array(field(fields, "rests"), "rests")) {
         const auto& values = object(item, "score rest");
@@ -1217,6 +1407,16 @@ ScoreDocument read_current_document(const JsonValue::Object& fields) {
                                       : ReviewDecisionOutcome::Rejected,
                 uint64_value(field(values, "revision"), "revision"),
                 string(field(values, "reason"), "reason")});
+        }
+    }
+    if (result.schema_version >= score_schema_version) {
+        for (const auto& item : array(field(fields, "corrections"), "corrections")) {
+            result.corrections.push_back(read_correction(item));
+        }
+    } else if (const auto* corrections = optional_field(fields, "corrections")) {
+        if (!array(*corrections, "corrections").empty()) {
+            throw std::invalid_argument(
+                "Score schema 1 cannot contain correction records.");
         }
     }
     for (const auto& item : array(field(fields, "history"), "history")) {
@@ -1612,7 +1812,8 @@ ScoreInterpretation to_score_interpretation(const ScoreDocument& document) {
 }
 
 void validate_score_document(const ScoreDocument& document) {
-    if (document.schema_version != score_schema_version) {
+    if (document.schema_version != legacy_score_schema_version &&
+        document.schema_version != score_schema_version) {
         throw std::invalid_argument("Unsupported score schema version.");
     }
     if (document.id.empty() || document.time_reference != "recording-relative-seconds" ||
@@ -1683,8 +1884,14 @@ void validate_score_document(const ScoreDocument& document) {
         document.notes.size() > 100000 ||
         document.rests.size() > 100000 ||
         document.tab_notes.size() > 100000 ||
-        document.review_decisions.size() > 100000) {
+        document.review_decisions.size() > 100000 ||
+        document.corrections.size() > 100000) {
         throw std::length_error("Score document exceeds a supported element limit.");
+    }
+    if (document.schema_version == legacy_score_schema_version &&
+        !document.corrections.empty()) {
+        throw std::invalid_argument(
+            "Score schema 1 cannot contain correction records.");
     }
     std::unordered_set<std::string> source_ids;
     for (const auto& event : document.source_events) {
@@ -1736,6 +1943,11 @@ void validate_score_document(const ScoreDocument& document) {
               note.spelling_octave < -1 || note.spelling_octave > 9)) ||
             (note.velocity && (*note.velocity < 0 || *note.velocity > 127))) {
             throw std::invalid_argument("Score note is invalid or has a duplicate ID.");
+        }
+        if (document.schema_version == legacy_score_schema_version &&
+            note.user_accepted) {
+            throw std::invalid_argument(
+                "Score schema 1 cannot contain accepted-note state.");
         }
         if ((note.tie_start || note.tie_stop) && !note.tie_group_id) {
             throw std::invalid_argument("A tied note must have a tie-group ID.");
@@ -1887,6 +2099,123 @@ void validate_score_document(const ScoreDocument& document) {
                 "Score review decision is invalid or duplicated.");
         }
     }
+    std::unordered_set<std::string> correction_ids;
+    std::uint64_t previous_correction_revision = 0;
+    for (const auto& correction : document.corrections) {
+        if (correction.id.empty() || correction.id.size() > 256 ||
+            !correction_ids.insert(correction.id).second ||
+            correction.revision == 0 ||
+            correction.revision > document.revision ||
+            correction.revision < previous_correction_revision ||
+            correction.actor.size() > 256 || correction.reason.size() > 512 ||
+            correction.command_id.size() > 256 ||
+            static_cast<int>(correction.operation) <
+                static_cast<int>(ScoreCorrectionKind::Accepted) ||
+            static_cast<int>(correction.operation) >
+                static_cast<int>(ScoreCorrectionKind::Merged) ||
+            correction.before.size() > 4 || correction.after.size() > 4) {
+            throw std::invalid_argument(
+                "Score correction is invalid, duplicated, or out of revision order.");
+        }
+        previous_correction_revision = correction.revision;
+        const auto validate_snapshots = [&](const auto& snapshots) {
+            std::unordered_set<std::string> snapshot_ids;
+            for (const auto& snapshot : snapshots) {
+                if (snapshot.note_id.empty() || snapshot.note_id.size() > 256 ||
+                    !snapshot_ids.insert(snapshot.note_id).second ||
+                    snapshot.sounding_midi_pitch < 0 ||
+                    snapshot.sounding_midi_pitch > 127 ||
+                    !std::isfinite(snapshot.measured_onset_seconds) ||
+                    !std::isfinite(snapshot.measured_offset_seconds) ||
+                    snapshot.measured_onset_seconds < 0.0 ||
+                    snapshot.measured_offset_seconds <
+                        snapshot.measured_onset_seconds ||
+                    !std::isfinite(snapshot.corrected_onset_seconds) ||
+                    !std::isfinite(snapshot.corrected_offset_seconds) ||
+                    snapshot.corrected_onset_seconds < 0.0 ||
+                    snapshot.corrected_offset_seconds <
+                        snapshot.corrected_onset_seconds ||
+                    !std::isfinite(snapshot.onset_quarters) ||
+                    snapshot.onset_quarters < 0.0 ||
+                    !std::isfinite(snapshot.duration_quarters) ||
+                    snapshot.duration_quarters <= 0.0) {
+                    throw std::invalid_argument(
+                        "Score correction contains an invalid note snapshot.");
+                }
+                std::unordered_set<std::string> linked_source_ids;
+                for (const auto& source_id : snapshot.source_event_ids) {
+                    if (!source_ids.contains(source_id) ||
+                        !linked_source_ids.insert(source_id).second) {
+                        throw std::invalid_argument(
+                            "Score correction refers to a missing or duplicate source event.");
+                    }
+                }
+            }
+        };
+        validate_snapshots(correction.before);
+        validate_snapshots(correction.after);
+        const auto before_size = correction.before.size();
+        const auto after_size = correction.after.size();
+        const auto same_note_id = [&] {
+            return before_size == 1 && after_size == 1 &&
+                correction.before.front().note_id ==
+                    correction.after.front().note_id;
+        };
+        switch (correction.operation) {
+        case ScoreCorrectionKind::Accepted:
+            if (!same_note_id() ||
+                correction.before.front().user_accepted ||
+                !correction.after.front().user_accepted) {
+                throw std::invalid_argument(
+                    "Accepted-note correction has an invalid snapshot shape.");
+            }
+            break;
+        case ScoreCorrectionKind::Rejected:
+        case ScoreCorrectionKind::Deleted:
+            if (before_size != 1 || after_size != 0) {
+                throw std::invalid_argument(
+                    "Removed-note correction has an invalid snapshot shape.");
+            }
+            break;
+        case ScoreCorrectionKind::Inserted:
+            if (before_size != 0 || after_size != 1) {
+                throw std::invalid_argument(
+                    "Inserted-note correction has an invalid snapshot shape.");
+            }
+            break;
+        case ScoreCorrectionKind::PitchAdjusted:
+            if (!same_note_id() ||
+                correction.before.front().sounding_midi_pitch ==
+                    correction.after.front().sounding_midi_pitch) {
+                throw std::invalid_argument(
+                    "Pitch correction has an invalid snapshot shape.");
+            }
+            break;
+        case ScoreCorrectionKind::TimingAdjusted:
+            if (!same_note_id() ||
+                (correction.before.front().onset_quarters ==
+                     correction.after.front().onset_quarters &&
+                 correction.before.front().duration_quarters ==
+                     correction.after.front().duration_quarters)) {
+                throw std::invalid_argument(
+                    "Timing correction has an invalid snapshot shape.");
+            }
+            break;
+        case ScoreCorrectionKind::Split:
+            if (before_size != 1 || after_size != 2 ||
+                correction.after[0].note_id == correction.after[1].note_id) {
+                throw std::invalid_argument(
+                    "Split correction has an invalid snapshot shape.");
+            }
+            break;
+        case ScoreCorrectionKind::Merged:
+            if (before_size != 2 || after_size != 1) {
+                throw std::invalid_argument(
+                    "Merge correction has an invalid snapshot shape.");
+            }
+            break;
+        }
+    }
 }
 
 ScoreEditor::ScoreEditor(ScoreDocument document) : document_(std::move(document)) {
@@ -1906,8 +2235,32 @@ ScoreTransactionResult ScoreEditor::apply(const ScoreTransaction& transaction) {
     }
     ScoreDocument candidate = document_;
     const std::uint64_t next_revision = document_.revision + 1;
-    for (const auto& command : transaction.commands) {
+    for (std::size_t index = 0; index < transaction.commands.size(); ++index) {
+        const auto& command = transaction.commands[index];
+        const auto shape = correction_shape(candidate, command);
+        const auto before = shape
+            ? correction_snapshots(candidate, shape->before_note_ids)
+            : std::vector<ScoreCorrectionNoteSnapshot>{};
         apply_command(candidate, command, transaction, next_revision);
+        if (shape) {
+            auto after = correction_snapshots(candidate, shape->after_note_ids);
+            if (before != after) {
+                const auto seed = transaction.command_id + ":" +
+                    std::to_string(next_revision) + ":" + std::to_string(index);
+                candidate.corrections.push_back({
+                    stable_id("correction-", seed),
+                    shape->operation,
+                    next_revision,
+                    transaction.actor,
+                    transaction.reason,
+                    transaction.command_id,
+                    true,
+                    before,
+                    std::move(after),
+                });
+                candidate.schema_version = score_schema_version;
+            }
+        }
     }
     candidate.revision = next_revision;
     for (const auto& note : candidate.notes) {
@@ -1941,6 +2294,14 @@ std::uint64_t ScoreEditor::undo(std::uint64_t expected_revision) {
     const auto next_revision = document_.revision + 1;
     auto history = document_.history;
     auto candidate = snapshot.before;
+    candidate.schema_version = std::max(candidate.schema_version,
+                                        document_.schema_version);
+    candidate.corrections = document_.corrections;
+    for (auto& correction : candidate.corrections) {
+        if (correction.revision == snapshot.after.revision) {
+            correction.active = false;
+        }
+    }
     candidate.revision = next_revision;
     candidate.history = std::move(history);
     candidate.history.push_back({next_revision, ScoreEditOrigin::Undo, "user",
@@ -1965,6 +2326,14 @@ std::uint64_t ScoreEditor::redo(std::uint64_t expected_revision) {
     const auto next_revision = document_.revision + 1;
     auto history = document_.history;
     auto candidate = snapshot.after;
+    candidate.schema_version = std::max(candidate.schema_version,
+                                        document_.schema_version);
+    candidate.corrections = document_.corrections;
+    for (auto& correction : candidate.corrections) {
+        if (correction.revision == snapshot.after.revision) {
+            correction.active = true;
+        }
+    }
     candidate.revision = next_revision;
     candidate.history = std::move(history);
     candidate.history.push_back({next_revision, ScoreEditOrigin::Redo, "user",
@@ -2161,8 +2530,12 @@ std::string serialize_score_document(const ScoreDocument& document) {
         else output << "null";
         output << ",\"tie_start\":" << (note.tie_start ? "true" : "false")
                << ",\"tie_stop\":" << (note.tie_stop ? "true" : "false")
-               << ",\"user_authored\":" << (note.user_authored ? "true" : "false")
-               << ",\"revision\":" << note.revision << ",\"provenance\":";
+               << ",\"user_authored\":" << (note.user_authored ? "true" : "false");
+        if (document.schema_version >= score_schema_version) {
+            output << ",\"user_accepted\":"
+                   << (note.user_accepted ? "true" : "false");
+        }
+        output << ",\"revision\":" << note.revision << ",\"provenance\":";
         write_provenance(output, note.provenance);
         output << '}';
     }
@@ -2216,7 +2589,67 @@ std::string serialize_score_document(const ScoreDocument& document) {
         json_string(output, decision.reason);
         output << '}';
     }
-    output << "],\"history\":[";
+    output << ']';
+    if (document.schema_version >= score_schema_version) {
+        output << ",\"corrections\":[";
+        for (std::size_t i = 0; i < document.corrections.size(); ++i) {
+            if (i) output << ',';
+            const auto& correction = document.corrections[i];
+            output << "{\"id\":";
+            json_string(output, correction.id);
+            output << ",\"operation\":";
+            json_string(output, correction_kind_name(correction.operation));
+            output << ",\"revision\":" << correction.revision
+                   << ",\"actor\":";
+            json_string(output, correction.actor);
+            output << ",\"reason\":";
+            json_string(output, correction.reason);
+            output << ",\"command_id\":";
+            json_string(output, correction.command_id);
+            output << ",\"active\":" << (correction.active ? "true" : "false")
+                   << ",\"before\":[";
+            const auto write_snapshots = [&](const auto& snapshots) {
+                for (std::size_t snapshot_index = 0;
+                     snapshot_index < snapshots.size(); ++snapshot_index) {
+                    if (snapshot_index) output << ',';
+                    const auto& snapshot = snapshots[snapshot_index];
+                    output << "{\"note_id\":";
+                    json_string(output, snapshot.note_id);
+                    output << ",\"source_event_ids\":[";
+                    for (std::size_t source_index = 0;
+                         source_index < snapshot.source_event_ids.size();
+                         ++source_index) {
+                        if (source_index) output << ',';
+                        json_string(output, snapshot.source_event_ids[source_index]);
+                    }
+                    output << "],\"sounding_midi_pitch\":"
+                           << snapshot.sounding_midi_pitch
+                           << ",\"measured_onset_seconds\":";
+                    json_number(output, snapshot.measured_onset_seconds);
+                    output << ",\"measured_offset_seconds\":";
+                    json_number(output, snapshot.measured_offset_seconds);
+                    output << ",\"corrected_onset_seconds\":";
+                    json_number(output, snapshot.corrected_onset_seconds);
+                    output << ",\"corrected_offset_seconds\":";
+                    json_number(output, snapshot.corrected_offset_seconds);
+                    output << ",\"onset_quarters\":";
+                    json_number(output, snapshot.onset_quarters);
+                    output << ",\"duration_quarters\":";
+                    json_number(output, snapshot.duration_quarters);
+                    output << ",\"user_authored\":"
+                           << (snapshot.user_authored ? "true" : "false")
+                           << ",\"user_accepted\":"
+                           << (snapshot.user_accepted ? "true" : "false") << '}';
+                }
+            };
+            write_snapshots(correction.before);
+            output << "],\"after\":[";
+            write_snapshots(correction.after);
+            output << "]}";
+        }
+        output << ']';
+    }
+    output << ",\"history\":[";
     for (std::size_t i = 0; i < document.history.size(); ++i) {
         if (i) output << ',';
         const auto& record = document.history[i];
@@ -2248,7 +2681,8 @@ ScoreDocument deserialize_score_document(std::string_view json) {
         result = migrate_legacy_document(fields);
     } else {
         const auto version = integer(*schema_version, "schema_version");
-        if (version != score_schema_version) {
+        if (version < legacy_score_schema_version ||
+            version > score_schema_version) {
             throw std::invalid_argument("Unsupported score project schema version: " +
                                         std::to_string(version));
         }
@@ -2390,7 +2824,7 @@ void validate_project_document(const ProjectDocument& project) {
     std::unordered_set<std::string> export_formats;
     for (const auto& status : project.exports) {
         if ((status.format != "musicxml" && status.format != "tablature" &&
-             status.format != "midi") ||
+             status.format != "midi" && status.format != "json") ||
             !export_formats.insert(status.format).second ||
             status.path.empty() || !valid_project_path(status.path) ||
             status.score_revision == 0 ||
@@ -2576,7 +3010,9 @@ ProjectDocument deserialize_project_document(std::string_view json) {
             }
             project.score = migrate_legacy_document(score_fields);
         } else {
-            if (integer(*score_schema, "schema_version") != score_schema_version) {
+            const auto version = integer(*score_schema, "schema_version");
+            if (version < legacy_score_schema_version ||
+                version > score_schema_version) {
                 throw std::invalid_argument(
                     "Legacy project contains an unsupported score schema.");
             }
@@ -2733,8 +3169,13 @@ ProjectDocument deserialize_project_document(std::string_view json) {
                 string(field(export_fields, "error"), "export error")});
         }
         const auto* score_schema = optional_field(score_fields, "schema_version");
-        if (score_schema == nullptr ||
-            integer(*score_schema, "schema_version") != score_schema_version) {
+        if (score_schema == nullptr) {
+            throw std::invalid_argument(
+                "Project contains an unsupported score schema version.");
+        }
+        const auto version = integer(*score_schema, "schema_version");
+        if (version < legacy_score_schema_version ||
+            version > score_schema_version) {
             throw std::invalid_argument(
                 "Project contains an unsupported score schema version.");
         }

@@ -47,7 +47,8 @@ EngineMetadata describe_engine(const ModelMetadata& model) {
     c.offsets = EngineBoundaryEvidence::Heuristic;
     c.providers = builtin ? std::vector{OnnxExecutionProvider::Cpu} :
         std::vector{OnnxExecutionProvider::Cpu, OnnxExecutionProvider::Cuda,
-                    OnnxExecutionProvider::DirectML, OnnxExecutionProvider::Rocm};
+                    OnnxExecutionProvider::DirectML, OnnxExecutionProvider::Rocm,
+                    OnnxExecutionProvider::TensorRT};
     return result;
 }
 
@@ -73,7 +74,9 @@ std::vector<std::string> mismatches(const EngineMetadata& metadata, const Engine
         reasons.push_back("Streaming activation output is unavailable; use offline retained evidence");
     if (r.model_onsets && c.onsets != EngineBoundaryEvidence::ModelHead)
         reasons.push_back("Model onset head is unavailable");
-    if (std::find(c.providers.begin(), c.providers.end(), r.provider) == c.providers.end())
+    if (std::find(c.providers.begin(), c.providers.end(), r.provider) == c.providers.end() &&
+        !(r.allow_cpu_fallback &&
+          std::find(c.providers.begin(), c.providers.end(), OnnxExecutionProvider::Cpu) != c.providers.end()))
         reasons.push_back("Requested hardware provider is not supported by this engine");
     return reasons;
 }
@@ -152,6 +155,7 @@ public:
         requirements.polyphonic = configuration.inference.analysis.polyphonic || configuration.inference.onnx.polyphonic;
         requirements.activations = configuration.inference.retain_evidence || configuration.segmentation.has_value();
         requirements.provider = load_.provider;
+        requirements.allow_cpu_fallback = load_.allow_cpu_fallback;
         auto effective = describe_engine(backend_->metadata());
         if (effective.model.definition.contract == ModelContract::LegacyPitchV1 &&
             effective.model.objective == PitchObjective::Unspecified &&
@@ -163,6 +167,19 @@ public:
         }
         const auto reasons = mismatches(effective, requirements);
         if (!reasons.empty()) return fail(InferenceErrorCode::Unsupported, reasons.front());
+        if (configuration.polyphonic_decoding) {
+            if (configuration.segmentation ||
+                configuration.inference.onnx.note_decoder != NeuralNoteDecoder::Legacy)
+                return fail(InferenceErrorCode::InvalidArgument,
+                    "Polyphonic tracking cannot be combined with legacy/event segmentation");
+            if (effective.model.objective != PitchObjective::IndependentMultiPitch)
+                return fail(InferenceErrorCode::Unsupported,
+                    "Polyphonic tracking requires an independent multi-pitch model");
+            try { validate_polyphonic_decoding_options(*configuration.polyphonic_decoding); }
+            catch (const std::invalid_argument& error) {
+                return fail(InferenceErrorCode::InvalidArgument, error.what());
+            }
+        }
         const auto ratio = [](double value) { return std::isfinite(value) && value >= 0 && value <= 1; };
         const auto& a = configuration.inference.analysis;
         if (configuration.inference.onnx.note_decoder != NeuralNoteDecoder::Legacy &&
@@ -200,6 +217,28 @@ public:
             request.onnx.execution_provider = load_.provider;
             request.onnx.device_id = load_.device_id;
             request.retain_evidence = request.retain_evidence || configuration_.segmentation.has_value();
+            if (configuration_.polyphonic_decoding) {
+                const auto& limits = *configuration_.polyphonic_decoding;
+                if (audio.sample_rate == 0)
+                    return fail(InferenceErrorCode::InvalidArgument, "Polyphonic audio requires a sample rate", true);
+                const double seconds = static_cast<double>(audio.samples.size()) / audio.sample_rate;
+                const auto& model = metadata_.model;
+                const double estimated_frames = model.output_frame_step_samples ?
+                    std::ceil(seconds * model.analysis_sample_rate / model.output_frame_step_samples) + 2 : 0;
+                const auto pitches = model.maximum_midi - model.minimum_midi + 1;
+                if (seconds > limits.maximum_audio_seconds ||
+                    audio.samples.size() > limits.maximum_audio_bytes / sizeof(float) ||
+                    estimated_frames * pitches > static_cast<double>(limits.maximum_grid_values))
+                    return fail(InferenceErrorCode::InvalidArgument,
+                        "Polyphonic input exceeds configured duration/activation budget; shorten the recording", true);
+                request.retain_evidence = true;
+                request.analysis.polyphonic = true;
+                request.analysis.maximum_pitches_per_frame = 69;
+                request.onnx.polyphonic = true;
+                request.onnx.maximum_pitches_per_frame = 69;
+                request.onnx.independent_probabilities = true;
+                request.onnx.aligned_model_heads = true;
+            }
             auto inferred = backend_->infer(audio, request);
             if (const auto* error = std::get_if<InferenceError>(&inferred))
                 return fail(error->code, error->message, true);
@@ -216,7 +255,32 @@ public:
                     selected_pitch_grid(update.evidence.front(), metadata_.model) :
                     pitch_activation_grid(update.evidence, metadata_.model.objective);
             }
-            if (configuration_.segmentation) {
+            if (configuration_.polyphonic_decoding) {
+                if (!update.activations)
+                    return fail(InferenceErrorCode::Inference, "Polyphonic model returned no activation grid", true);
+                if (metadata_.model.definition.contract == ModelContract::Spectral) {
+                    // Raw spectral magnitudes depend on input gain; use the declared relative selections.
+                    auto& grid = *update.activations;
+                    const auto pitches = static_cast<std::size_t>(grid.maximum_midi - grid.minimum_midi + 1);
+                    for (const auto& track : update.evidence) {
+                        const auto pitch = static_cast<std::size_t>(track.raw_midi_pitch - grid.minimum_midi);
+                        for (std::size_t f = 0; f < track.frames.size(); ++f)
+                            grid.values[f * pitches + pitch] = track.frames[f].confidence;
+                    }
+                    grid.semantics = EvidenceSemantics::RelativeActivation;
+                }
+                update.polyphonic = decode_polyphonic(*update.activations, audio.sample_rate,
+                    audio.samples.size(), *configuration_.polyphonic_decoding,
+                    configuration_.audio_source_id, metadata_.id, stop_.get_token());
+                update.notes.clear();
+                for (const auto& event : update.polyphonic->events) {
+                    const auto pitch = static_cast<int>(std::lround(event.midi_pitch));
+                    update.notes.push_back({pitch, event.onset_seconds,
+                        event.offset_seconds - event.onset_seconds, midi_note_name(pitch),
+                        event.evidence.front().raw_strength, 0});
+                    update.events.push_back(from_canonical(event));
+                }
+            } else if (configuration_.segmentation) {
                 auto decoded = decode_note_events(audio, update.evidence, *configuration_.segmentation,
                     configuration_.audio_source_id, metadata_.id);
                 update.notes.clear();
@@ -260,6 +324,9 @@ public:
         if (state_ != EngineState::Ready)
             return fail(InferenceErrorCode::NotLoaded, "Begin stream requires a Ready engine");
         if (!incremental()) return fail(InferenceErrorCode::Unsupported, "Engine has no incremental interface");
+        if (configuration_.polyphonic_decoding)
+            return fail(InferenceErrorCode::Unsupported,
+                "Polyphonic tracking currently requires a finite recording; live reconciliation is separate");
         if (configuration_.inference.retain_evidence ||
             configuration_.inference.analysis.evidence_callback || configuration_.inference.onnx.evidence_callback)
             return fail(InferenceErrorCode::Unsupported, "Live engine publishes note revisions, not activation tracks");
@@ -495,6 +562,9 @@ ModelOperation EngineRegistry::add(EngineMetadata metadata, Factory factory) {
 ModelOperation EngineRegistry::add_model(ModelDefinition definition, ModelRegistry::Factory factory) {
     if (!factory || definition.contract_version != model_contract_version || definition.id.empty())
         return failure(InferenceErrorCode::InvalidArgument, "Engine model registration requires version 1, ID and factory");
+    if (definition.contract == ModelContract::Custom)
+        return failure(InferenceErrorCode::Unsupported,
+            "Custom model contracts require explicit EngineMetadata through EngineRegistry::add");
     try {
         auto model = factory(definition);
         if (!model) return failure(InferenceErrorCode::ModelLoad, "Engine model factory returned null");
@@ -522,6 +592,13 @@ EngineSelection EngineRegistry::select(const EngineRequirements& r) const {
         (r.minimum_midi && r.maximum_midi && *r.minimum_midi > *r.maximum_midi);
     for (const auto& entry : entries_) {
         EngineAvailability candidate{entry.metadata, false, mismatches(entry.metadata, r), {}};
+        const auto& declared_providers = entry.metadata.capabilities.providers;
+        bool cpu_fallback_preflight = r.allow_cpu_fallback &&
+            r.provider != OnnxExecutionProvider::Cpu &&
+            std::find(declared_providers.begin(), declared_providers.end(), r.provider) ==
+                declared_providers.end() &&
+            std::find(declared_providers.begin(), declared_providers.end(),
+                OnnxExecutionProvider::Cpu) != declared_providers.end();
         if (invalid) candidate.reasons.push_back("Invalid requested pitch range");
         const auto& d = entry.metadata.model.definition;
         if (d.contract == ModelContract::BasicPitchV1 || d.contract == ModelContract::LegacyPitchV1) {
@@ -531,12 +608,28 @@ EngineSelection EngineRegistry::select(const EngineRequirements& r) const {
             const auto providers = inference_providers();
             const auto provider = std::find_if(providers.begin(), providers.end(),
                 [&](const auto& p) { return p.provider == r.provider; });
-            if (provider == providers.end() || !provider->compiled || !provider->runtime_available)
-                candidate.reasons.push_back(provider == providers.end() ? "Unknown provider" : provider->diagnostic);
+            if (provider == providers.end() || !provider->compiled || !provider->runtime_available) {
+                if (r.allow_cpu_fallback && r.provider != OnnxExecutionProvider::Cpu) {
+                    const auto cpu = std::find_if(providers.begin(), providers.end(),
+                        [](const auto& p) { return p.provider == OnnxExecutionProvider::Cpu; });
+                    if (cpu != providers.end() && cpu->compiled && cpu->runtime_available) {
+                        cpu_fallback_preflight = true;
+                    } else {
+                        candidate.reasons.push_back(
+                            "Requested provider is unavailable and CPU fallback is unavailable");
+                    }
+                } else {
+                    candidate.reasons.push_back(
+                        provider == providers.end() ? "Unknown provider" : provider->diagnostic);
+                }
+            }
         }
         candidate.available = candidate.reasons.empty();
         candidate.explanation = candidate.available ?
-            "Declared capabilities match; initialization must still validate model tensors and runtime resources" :
+            (cpu_fallback_preflight ?
+                "Requested provider is unavailable; explicitly enabled CPU fallback is available. "
+                "Initialization must still validate model tensors and runtime resources" :
+                "Declared capabilities match; initialization must still validate model tensors and runtime resources") :
             "Unavailable for this request: " + candidate.reasons.front();
         if (candidate.available && !result.selected_id) result.selected_id = entry.metadata.id;
         result.candidates.push_back(std::move(candidate));

@@ -159,6 +159,32 @@ TEST_CASE("engine capabilities distinguish incremental YIN from windowed and unk
         [](const auto& reason) { return reason.find("instrument") != std::string::npos; }));
 }
 
+TEST_CASE("engine selection and initialization honor explicit CPU fallback", "[engine][providers]") {
+    EngineRegistry registry;
+    EngineRequirements requirements;
+    requirements.provider = OnnxExecutionProvider::Cuda;
+    REQUIRE_FALSE(registry.select(requirements).selected_id);
+    requirements.allow_cpu_fallback = true;
+    const auto selection = registry.select(requirements);
+    REQUIRE(selection.selected_id == "builtin:yin");
+    REQUIRE(selection.candidates.front().explanation.find("CPU fallback") != std::string::npos);
+
+    auto instance = engine(registry, "builtin:yin");
+    ModelLoadOptions options;
+    options.provider = OnnxExecutionProvider::Cuda;
+    options.allow_cpu_fallback = true;
+    success(instance->initialize(options));
+    const auto diagnostics = instance->diagnostics().backend;
+    REQUIRE(diagnostics.requested_provider == OnnxExecutionProvider::Cuda);
+    REQUIRE(diagnostics.active_provider == OnnxExecutionProvider::Cpu);
+    REQUIRE(diagnostics.cpu_fallback_used);
+    EngineConfiguration configuration;
+    configuration.audio_source_id = "fallback-test";
+    configuration.inference.onnx.execution_provider = OnnxExecutionProvider::Cuda;
+    success(instance->configure(configuration));
+    instance->shutdown();
+}
+
 TEST_CASE("YIN and spectral engines retain exact adapter notes with a shared timestamped result structure", "[engine]") {
     const auto audio = fixture();
     for (const std::string id : {"builtin:yin", "builtin:spectral"}) {

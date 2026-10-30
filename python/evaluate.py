@@ -33,6 +33,7 @@ from evaluate_guitarset import (
     ANNOTATION_MD5, AUDIO_MD5, DATASET_VERSION, guitarset_dataset_split,
     guitarset_player_id, guitarset_split_policy, md5_file, read_reference_events, sha256_file,
 )
+from evaluation_datasets import maestro_corpus, maps_corpus, musicnet_corpus
 from evaluation_environment import host_identity
 
 
@@ -50,6 +51,7 @@ def source_identity() -> dict:
     files = ["python/evaluate.py", "python/evaluation_metrics.py", "python/synthetic_corpus.py",
              "python/quality_release_gate.py",
              "python/evaluate_guitarset.py", "python/evaluation_environment.py",
+             "python/evaluation_datasets.py",
              "tests/evaluation_runner.cpp", "CMakeLists.txt",
              "tests/evaluation_build.json.in", "src/transcriber.cpp", "src/audio_file.cpp",
              "src/audio_ring_buffer.cpp", "include/transcribe/transcriber.hpp",
@@ -83,6 +85,30 @@ def build_identity(path: Path, runner: Path) -> dict:
 
 
 def real_corpus(args, directory: Path) -> dict:
+    corpus_name = getattr(args, "corpus", "guitarset")
+    if corpus_name in ("maestro", "maps", "musicnet"):
+        dataset_root = getattr(args, "dataset_root", None)
+        if dataset_root is None:
+            raise ValueError(f"{corpus_name.upper()} requires --dataset-root")
+        if getattr(args, "audio_zip", None) is not None or getattr(
+            args, "annotations_zip", None
+        ) is not None:
+            raise ValueError(f"{corpus_name.upper()} uses --dataset-root, not GuitarSet archives")
+        loaders = {
+            "maestro": maestro_corpus,
+            "maps": maps_corpus,
+            "musicnet": musicnet_corpus,
+        }
+        return loaders[corpus_name](
+            dataset_root,
+            getattr(args, "dataset_split", "all"),
+            getattr(args, "limit", None),
+            getattr(args, "seed", 2026),
+        )
+    if corpus_name != "guitarset":
+        raise ValueError(f"Unsupported real corpus: {corpus_name}")
+    if getattr(args, "dataset_root", None) is not None:
+        raise ValueError("GuitarSet uses --audio-zip and --annotations-zip, not --dataset-root")
     if args.audio_zip is None or args.annotations_zip is None:
         raise ValueError("GuitarSet requires --audio-zip and --annotations-zip")
     actual = {}
@@ -133,7 +159,8 @@ def real_corpus(args, directory: Path) -> dict:
             with wave.open(str(path), "rb") as wav:
                 rate = wav.getframerate()
                 duration = wav.getnframes() / rate
-            notes = read_reference_events(json.loads(labels.read(name)))
+            annotation_bytes = labels.read(name)
+            notes = read_reference_events(json.loads(annotation_bytes))
             for event in notes:
                 event.update(onset=event["start"], offset=event["start"] + event["duration"],
                              instrument="guitar", velocity=None)
@@ -149,6 +176,7 @@ def real_corpus(args, directory: Path) -> dict:
                 scenarios.append(split)
             clips.append(dict(id=track, audio=path.name, sample_rate=rate,
                               duration_seconds=duration, notes=notes, sha256=sha256_file(path),
+                              annotation_sha256=hashlib.sha256(annotation_bytes).hexdigest(),
                               dataset_split=split or "unassigned",
                               performer_id=guitarset_player_id(track), scenarios=scenarios))
     corpus = dict(name="GuitarSet", version=DATASET_VERSION, seed=args.seed,
@@ -276,6 +304,7 @@ def summarize(rows: list[dict], tolerances: Tolerances) -> dict:
     process, analysis, totals = [], [], []
     memory = []
     references = predictions = fragmented = extra_fragments = merged = extra_reference_notes = 0
+    offset_correct = offset_matches = 0
     for row in rows:
         refs, preds = row["references"], row["predictions"]
         references += len(refs)
@@ -284,6 +313,8 @@ def summarize(rows: list[dict], tolerances: Tolerances) -> dict:
         extra_fragments += row["metrics"]["note_fragmentation"]["extra_predicted_fragments"]
         merged += row["metrics"]["note_merging"]["merged_predictions"]
         extra_reference_notes += row["metrics"]["note_merging"]["extra_reference_notes"]
+        offset_correct += row["metrics"]["offset_accuracy"]["correct"]
+        offset_matches += row["metrics"]["offset_accuracy"]["onset_matches"]
         for r, p in event_pairs(refs, preds, tolerances=tolerances):
             onsets.append(abs(preds[p]["start"] - refs[r]["start"]))
             offsets.append(abs(preds[p]["start"] + preds[p]["duration"]
@@ -298,6 +329,13 @@ def summarize(rows: list[dict], tolerances: Tolerances) -> dict:
     audio_seconds = sum(row["duration_seconds"] for row in rows)
     prediction_count = sum(len(row["predictions"]) for row in rows)
     summary.update(
+        note_precision=summary["note_event"]["precision"],
+        note_recall=summary["note_event"]["recall"],
+        f1_score=summary["note_event"]["f1"],
+        onset_accuracy=(summary["onset_pitch"]["tp"] / references if references else None),
+        offset_accuracy=(offset_correct / offset_matches if offset_matches else None),
+        offset_accuracy_counts=dict(correct=offset_correct, onset_matches=offset_matches),
+        polyphonic_accuracy=summary["frame"]["f1"],
         clip_count=len(rows), reference_notes=references, predicted_notes=predictions,
         false_positives=summary["note_event"]["fp"], missed_notes=summary["note_event"]["fn"],
         false_positives_per_minute=(
@@ -369,7 +407,9 @@ def evaluate(args) -> dict:
     config = dict(backend=args.backend, mode=args.mode, fast=args.fast, parallel=not args.serial,
                   minimum_confidence=args.minimum_confidence, provider=args.provider,
                   corpus_version=args.corpus_version if args.corpus == "synthetic" else None,
-                  dataset_split=args.dataset_split if args.corpus in ("guitarset", "mixed") else None,
+                  dataset_split=args.dataset_split if args.corpus in (
+                      "guitarset", "maestro", "maps", "musicnet", "mixed"
+                  ) else None,
                   chunk_seconds=args.chunk_seconds, overlap_seconds=args.overlap_seconds,
                   realtime_latency_ms=args.latency_ms, realtime_update_rate_hz=100,
                   realtime_minimum_confidence=.45, maximum_pitches_per_frame=6,
@@ -410,8 +450,9 @@ def evaluate(args) -> dict:
         for clip in corpus["clips"]:
             args.instrument = clip.get("instrument", "none")
             data_runs, wall_runs = [], []
+            audio_path = Path(clip["audio_path"]) if clip.get("audio_path") else directory / clip["audio"]
             for iteration in range(args.warmups + args.repetitions):
-                data, wall = invoke(args, directory / clip["audio"], directory / "prediction.json")
+                data, wall = invoke(args, audio_path, directory / "prediction.json")
                 if data["sample_rate"] != clip["sample_rate"] or abs(
                     data["duration_seconds"] - clip["duration_seconds"]
                 ) > 1 / clip["sample_rate"]:
@@ -449,7 +490,8 @@ def evaluate(args) -> dict:
                 real_time_factor=[run["total_seconds"] / clip["duration_seconds"]
                                   if clip["duration_seconds"] else None for run in data_runs],
             ))
-            for key in ("pair_id", "variant", "instrument", "separation", "artifacts", "source", "license"):
+            for key in ("pair_id", "variant", "instrument", "separation", "artifacts", "source",
+                        "license", "annotation_sha256"):
                 if key in clip:
                     rows[-1][key] = clip[key]
         corpus.pop("clips")
@@ -677,6 +719,16 @@ def human_report(report: dict) -> str:
         m = summary[metric]
         lines.append(f"{metric:12} P {m['precision']:.4f} R {m['recall']:.4f} F1 {m['f1']:.4f}"
                      f" (TP {m['tp']}, FP {m['fp']}, FN {m['fn']})")
+    format_score = lambda value: "n/a" if value is None else f"{value:.4f}"
+    lines.append(
+        "Requested metrics: "
+        f"note precision={format_score(summary['note_precision'])}; "
+        f"note recall={format_score(summary['note_recall'])}; "
+        f"F1 score={format_score(summary['f1_score'])}; "
+        f"onset accuracy={format_score(summary['onset_accuracy'])}; "
+        f"offset accuracy={format_score(summary['offset_accuracy'])}; "
+        f"polyphonic accuracy={format_score(summary['polyphonic_accuracy'])}"
+    )
     for name in ("pitch_accuracy", "chord_note_recall"):
         value = summary[name]["value"]
         lines.append(f"{name}: {value:.4f}" if value is not None else f"{name}: n/a (no eligible notes)")
@@ -743,6 +795,20 @@ def markdown_report(report: dict) -> str:
             )
         return rows
 
+    def benchmark_metrics_table(summary, frame_seconds):
+        return [
+            "#### Requested benchmark metrics",
+            "",
+            "| Metric | Score (0-1) | Definition |",
+            "|---|---:|---|",
+            f"| Note precision | {value(summary['note_precision'])} | Exact-pitch note events matched on onset and offset |",
+            f"| Note recall | {value(summary['note_recall'])} | Exact-pitch note events matched on onset and offset |",
+            f"| F1 score | {value(summary['f1_score'])} | Micro-aggregated strict note-event F1 |",
+            f"| Onset accuracy | {value(summary['onset_accuracy'])} | Exact-pitch onset recall within the configured onset tolerance |",
+            f"| Offset accuracy | {value(summary['offset_accuracy'])} | Offset-tolerance pass rate among exact-pitch onset matches |",
+            f"| Polyphonic accuracy | {value(summary['polyphonic_accuracy'])} | Framewise pitch-activity F1 at {frame_seconds:g} s |",
+        ]
+
     def provenance_block(corpus):
         fields = ("provenance", "license", "dataset_split_policy", "selected_split",
                   "training_data_warning")
@@ -758,6 +824,8 @@ def markdown_report(report: dict) -> str:
             f"`{single['configuration']['provider']}`.",
             "",
             *metrics_table(summary),
+            "",
+            *benchmark_metrics_table(summary, single["tolerances"]["frame_seconds"]),
             "",
             f"False positives/min: **{value(summary['false_positives_per_minute'], 3)}**; "
             f"fragmented references: **{summary['note_fragmentation']['fragmented_reference_notes']}** "
@@ -963,7 +1031,9 @@ def parse_args():
     parser.add_argument("--output-markdown", type=Path)
     parser.add_argument("--backend", choices=("yin", "spectral", "onnx", "all"), default="yin")
     parser.add_argument("--mode", choices=("full", "streaming", "realtime"))
-    parser.add_argument("--corpus", choices=("synthetic", "guitarset", "mixed"), default="synthetic")
+    parser.add_argument("--corpus", choices=(
+        "synthetic", "guitarset", "maestro", "maps", "musicnet", "mixed"
+    ), default="synthetic")
     parser.add_argument("--paired-manifest", type=Path,
                         help="Mixed original/stem pairs with target-only note annotations and licensing; absent uses synthetic oracle/damage checks")
     parser.add_argument("--corpus-version", type=int, choices=(1, 2, 3), default=1)
@@ -975,7 +1045,7 @@ def parse_args():
     parser.add_argument("--models", type=Path, action="append",
                         help="ONNX model path; repeat to evaluate multiple models in --backend all mode")
     parser.add_argument("--model-identifier")
-    parser.add_argument("--provider", choices=("cpu", "cuda", "directml", "rocm"), default="cpu")
+    parser.add_argument("--provider", choices=("cpu", "cuda", "directml", "rocm", "tensorrt"), default="cpu")
     parser.add_argument("--fast", action="store_true")
     parser.add_argument("--serial", action="store_true")
     parser.add_argument("--temporal", action="store_true")
@@ -1011,6 +1081,8 @@ def parse_args():
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=float, default=120)
+    parser.add_argument("--dataset-root", type=Path,
+                        help="Extracted MAESTRO, MAPS, or MusicNet root directory")
     parser.add_argument("--audio-zip", type=Path)
     parser.add_argument("--annotations-zip", type=Path)
     parser.add_argument("--limit", type=int)
@@ -1073,7 +1145,23 @@ def parse_args():
                                     or args.minimum_confidence != .25))):
         parser.error("Unsupported backend/mode/model/provider combination")
     if args.corpus == "synthetic" and args.dataset_split != "all":
-        parser.error("--dataset-split applies only to the GuitarSet corpus")
+        parser.error("--dataset-split does not apply to the synthetic corpus")
+    if args.corpus == "maps" and args.dataset_split != "all":
+        parser.error("MAPS has no canonical split in this adapter; use --dataset-split all")
+    if args.corpus == "musicnet" and args.dataset_split == "validation":
+        parser.error("MusicNet provides train/test splits, not a validation split")
+    if args.corpus == "guitarset":
+        if args.dataset_root is not None:
+            parser.error("GuitarSet requires --audio-zip and --annotations-zip, not --dataset-root")
+        if args.audio_zip is None or args.annotations_zip is None:
+            parser.error("GuitarSet requires --audio-zip and --annotations-zip")
+    elif args.corpus in ("maestro", "maps", "musicnet"):
+        if args.dataset_root is None:
+            parser.error(f"{args.corpus.upper()} requires --dataset-root")
+        if args.audio_zip is not None or args.annotations_zip is not None:
+            parser.error(f"{args.corpus.upper()} uses --dataset-root, not GuitarSet archives")
+    elif args.dataset_root is not None or args.audio_zip is not None or args.annotations_zip is not None:
+        parser.error("Dataset-root and GuitarSet archive options require a real dataset corpus")
     if args.paired_manifest and args.corpus != "mixed":
         parser.error("--paired-manifest requires --corpus mixed")
     if args.max_event_f1_drop is not None and (

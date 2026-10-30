@@ -19,12 +19,14 @@ struct SourceNote {
     double weight{1.0};
     std::optional<int> velocity;
     std::optional<std::string> articulation;
+    std::optional<double> accent;
 };
 
 struct OnsetGroup {
     double seconds{};
     double weight{};
     std::vector<std::size_t> source_indices;
+    std::optional<double> accent;
 };
 
 struct Candidate {
@@ -90,9 +92,11 @@ std::vector<SourceNote> active_notes(
     for (std::size_t i = 0; i < events.size(); ++i) {
         const auto& event = *events[i];
         if (event.state == EventLifecycle::Rejected) continue;
+        std::optional<double> accent = event.intensity_rms;
+        if (!accent && event.velocity) accent = *event.velocity / 127.0;
         result.push_back({i, event.midi_pitch, event.onset_seconds, event.offset_seconds,
                           interpretation_weight(event),
-                          event.velocity, event.articulation});
+                          event.velocity, event.articulation, accent});
     }
     std::stable_sort(result.begin(), result.end(), [](const SourceNote& a, const SourceNote& b) {
         if (a.onset != b.onset) return a.onset < b.onset;
@@ -106,11 +110,12 @@ std::vector<OnsetGroup> make_onset_groups(const std::vector<SourceNote>& notes,
     std::vector<OnsetGroup> groups;
     for (const auto& note : notes) {
         if (groups.empty() || note.onset - groups.back().seconds > tolerance) {
-            groups.push_back({note.onset, 0.0, {}});
+            groups.push_back({note.onset, 0.0, {}, {}});
         }
         auto& group = groups.back();
         group.weight += std::max(0.1, note.weight);
         group.source_indices.push_back(note.index);
+        if (note.accent) group.accent = std::max(group.accent.value_or(0.0), *note.accent);
     }
     return groups;
 }
@@ -168,8 +173,8 @@ std::vector<Candidate> estimate_tempo_candidates(const std::vector<OnsetGroup>& 
 
     double beat_seconds = swing_beats.empty() ? median(intervals) : median(swing_beats);
     if (swing_beats.empty()) {
-        while (beat_seconds < 1.0 / 3.0) beat_seconds *= 2.0;
-        while (beat_seconds > 1.0) beat_seconds *= 0.5;
+        while (beat_seconds < 1.0 / 3.0 - 1e-9) beat_seconds *= 2.0;
+        while (beat_seconds > 1.0 + 1e-9) beat_seconds *= 0.5;
     }
     beat_seconds = std::clamp(beat_seconds, 60.0 / 240.0, 60.0 / 40.0);
     const double base_bpm = 60.0 / beat_seconds;
@@ -300,10 +305,7 @@ std::vector<KeyHypothesis> estimate_keys(const std::vector<SourceNote>& notes,
     std::vector<KeyHypothesis> result;
     for (std::size_t i = 0; i < std::min<std::size_t>(ranked.size(), 3); ++i) {
         auto key = ranked[i].first;
-        key.confidence = i == 0
-            ? clamp01((best - second) * 3.0) * evidence
-            : clamp01((ranked[i].second - ranked[std::min<std::size_t>(i + 1, ranked.size() - 1)].second) *
-                      3.0) * evidence;
+        key.confidence = clamp01((best - second - (best - ranked[i].second)) * 3.0) * evidence;
         result.push_back(key);
     }
     return result;
@@ -332,6 +334,7 @@ std::vector<MeterHypothesis> rank_meters(std::vector<MeterHypothesis> meters,
         const double bar = quarter_measure_length(meter);
         double score = 0.0;
         double weight_sum = 0.0;
+        std::vector<std::pair<double, double>> accents;
         for (const auto& group : groups) {
             const double q = quarter_at(group.seconds);
             const double phase = std::fmod(q, bar);
@@ -346,13 +349,41 @@ std::vector<MeterHypothesis> rank_meters(std::vector<MeterHypothesis> meters,
                 }
                 boundary += static_cast<double>(meter.grouping[i]) * 4.0 / meter.denominator;
             }
-            best_distance = std::min(best_distance, std::abs(bar - phase));
+            if (std::abs(bar - phase) < best_distance) {
+                best_distance = std::abs(bar - phase);
+                nearest_strength = 1.0;
+            }
             const double beat_alignment = std::exp(-best_distance / 0.15);
+            if (group.accent)
+                accents.emplace_back(*group.accent, nearest_strength * beat_alignment);
             const double weight = std::max(0.1, group.weight);
             score += weight * (0.5 * beat_alignment + 0.5 * nearest_strength);
             weight_sum += weight;
         }
-        raw_scores.push_back(weight_sum > 0.0 ? score / weight_sum : 0.0);
+        double support = weight_sum > 0.0 ? score / weight_sum : 0.0;
+        if (accents.size() >= 8) {
+            double observed_mean = 0, expected_mean = 0;
+            for (const auto& [observed, expected] : accents) {
+                observed_mean += observed;
+                expected_mean += expected;
+            }
+            observed_mean /= accents.size();
+            expected_mean /= accents.size();
+            double covariance = 0, observed_variance = 0, expected_variance = 0;
+            for (const auto& [observed, expected] : accents) {
+                covariance += (observed - observed_mean) * (expected - expected_mean);
+                observed_variance += (observed - observed_mean) * (observed - observed_mean);
+                expected_variance += (expected - expected_mean) * (expected - expected_mean);
+            }
+            // Constant dynamics cannot distinguish bar lengths. Detector confidence
+            // remains separate from the performed RMS/velocity accent pattern.
+            if (observed_variance / accents.size() >= 0.0025) {
+                const double correlation = expected_variance > 1e-12 ?
+                    covariance / std::sqrt(observed_variance * expected_variance) : 0.0;
+                support = 0.35 * support + 0.65 * (1.0 + correlation) * 0.5;
+            }
+        }
+        raw_scores.push_back(support);
     }
     std::vector<std::size_t> order(meters.size());
     std::iota(order.begin(), order.end(), 0);
@@ -365,9 +396,8 @@ std::vector<MeterHypothesis> rank_meters(std::vector<MeterHypothesis> meters,
                             (std::min<double>(notes.size(), 24.0) + 8.0);
     for (std::size_t rank = 0; rank < order.size(); ++rank) {
         const auto index = order[rank];
-        const double gap = rank == 0 ? best_score - second_score :
-            best_score - raw_scores[index];
-        meters[index].confidence = clamp01(gap * 4.0) * evidence;
+        const double support = best_score - second_score - (best_score - raw_scores[index]);
+        meters[index].confidence = clamp01(support * 4.0) * evidence;
     }
     std::vector<MeterHypothesis> ranked;
     ranked.reserve(meters.size());
@@ -1020,6 +1050,11 @@ ScoreInterpretation interpret_note_events(std::span<const CanonicalNoteEvent> ev
             event.offset_seconds < event.onset_seconds) {
             throw std::invalid_argument("Raw note event has invalid pitch or measured timing.");
         }
+        if ((event.intensity_rms && (!std::isfinite(*event.intensity_rms) ||
+                                    *event.intensity_rms < 0 || *event.intensity_rms > 1)) ||
+            (event.velocity && (*event.velocity < 0 || *event.velocity > 127))) {
+            throw std::invalid_argument("Raw note event has invalid RMS intensity or MIDI velocity.");
+        }
         result.source_events.push_back(std::make_shared<const CanonicalNoteEvent>(event));
     }
     const auto notes = active_notes(result.source_events);
@@ -1077,8 +1112,9 @@ ScoreInterpretation interpret_note_events(std::span<const CanonicalNoteEvent> ev
         auto hypothesis = build_hypothesis(notes, groups, combination.tempo,
             combination.meter, combination.key, swing_ratio, swing_confidence,
             options, i + 1);
-        for (std::size_t key_index = 1; key_index < keys.size(); ++key_index) {
-            hypothesis.alternative_keys.push_back(keys[key_index]);
+        for (const auto& key : keys) {
+            if (key.fifths != combination.key.fifths || key.minor != combination.key.minor)
+                hypothesis.alternative_keys.push_back(key);
         }
         result.hypotheses.push_back(std::move(hypothesis));
     }

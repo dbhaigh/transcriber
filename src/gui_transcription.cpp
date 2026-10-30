@@ -393,8 +393,55 @@ Result run_transcription(const Request& request, std::stop_token stop_token,
     std::vector<Note> notes;
     std::uint32_t audio_sample_rate = 0;
     std::uint64_t audio_frame_count = 0;
+    std::optional<PolyphonicTranscription> polyphonic;
 
-    if (request.bounded_inference) {
+    if (request.polyphonic && !request.use_asio) {
+        if (request.bounded_inference)
+            throw std::invalid_argument("Tracked polyphonic analysis cannot use bounded neural windows yet.");
+        if (extension == ".wav") {
+            const auto info = inspect_wav(analysis_path);
+            if (static_cast<double>(info.frames) / info.sample_rate >
+                    PolyphonicDecodingOptions{}.maximum_audio_seconds ||
+                info.frames > PolyphonicDecodingOptions{}.maximum_audio_bytes / sizeof(float))
+                throw std::length_error("Tracked polyphonic recordings are limited to 120 seconds and 64 MiB decoded audio.");
+        }
+        const auto audio = read_audio(analysis_path, stop_token);
+        audio_sample_rate = audio.sample_rate;
+        audio_frame_count = audio.samples.size();
+        if (audio_preview_callback)
+            audio_preview_callback(0, make_audio_preview(audio.samples, audio.sample_rate, 512, 48), true);
+        EngineRegistry registry(request.model_path);
+        auto created = registry.create(request.model_path.empty() ?
+            "builtin:spectral" : "onnx:basic-pitch-v1");
+        if (const auto* error = std::get_if<InferenceError>(&created))
+            throw std::runtime_error(error->message);
+        auto engine = std::move(std::get<std::unique_ptr<TranscriptionEngine>>(created));
+        ModelLoadOptions load;
+        load.fast_preview = request.fast_preview;
+        const auto initialized = engine->initialize(load);
+        if (const auto* error = std::get_if<InferenceError>(&initialized))
+            throw std::runtime_error(error->message);
+        EngineConfiguration configuration;
+        configuration.audio_source_id = path_utf8(request.input_path);
+        configuration.polyphonic_decoding.emplace();
+        configuration.inference.analysis.instrument = request.model_path.empty() ?
+            request.instrument : InstrumentPrior::None;
+        configuration.inference.cancellation = stop_token;
+        configuration.inference.analysis.evidence_callback = retain_evidence;
+        configuration.inference.onnx.evidence_callback = retain_evidence;
+        configuration.inference.progress = [&](double value) {
+            report_progress(progress_callback, value, "Tracking simultaneous notes and chords");
+        };
+        const auto configured = engine->configure(configuration);
+        if (const auto* error = std::get_if<InferenceError>(&configured))
+            throw std::runtime_error(error->message);
+        auto analyzed = engine->transcribe(audio, stop_token);
+        if (const auto* error = std::get_if<InferenceError>(&analyzed))
+            throw std::runtime_error(error->message);
+        auto& output = std::get<EngineUpdate>(analyzed);
+        notes = std::move(output.notes);
+        polyphonic = std::move(output.polyphonic);
+    } else if (request.bounded_inference) {
         if (request.use_asio || extension != ".wav" || request.model_path.empty()) {
             throw std::invalid_argument("Bounded neural analysis requires a WAV file and a Basic Pitch model.");
         }
@@ -570,7 +617,9 @@ Result run_transcription(const Request& request, std::stop_token stop_token,
     } else if (request.instrument == InstrumentPrior::Bass) {
         interpretation_options.instrument = "Bass";
     }
-    const auto interpretation = interpret_notes(notes, interpretation_options);
+    const auto interpretation = polyphonic ?
+        interpret_note_events(polyphonic->events, interpretation_options) :
+        interpret_notes(notes, interpretation_options);
     if (interpretation.hypotheses.empty()) {
         throw std::runtime_error("Musical interpretation produced no score hypothesis.");
     }
@@ -581,6 +630,7 @@ Result run_transcription(const Request& request, std::stop_token stop_token,
         result.metadata,
         request.guitar_tab_options);
     result.audio_sample_rate = audio_sample_rate;
+    result.polyphonic = std::move(polyphonic);
     verify_prepared_audio(prepared);
     if (!request.isolated_audio_path.empty()) {
         result.preprocessing_diagnostic = prepared.diagnostic;

@@ -2,8 +2,8 @@
 
 The [engine layer](engines.md) composes this interface with versioned engine
 configuration, capability selection, common result updates and optional live
-input. `ModelBackend` remains the lower-level inference adapter; its existing
-public contracts remain backward-compatible.
+input. `IInferenceSession` is the provider-neutral session contract;
+`ModelBackend` remains a source-compatible alias for existing adapters.
 
 For explicit neural speed/quality selection, per-head geometry, pinned acquisition,
 validation-only confidence calibration and measured note-event results, see
@@ -89,8 +89,11 @@ must not be advertised as identical to incremental use of an offline adapter.
 
 ### Providers and lifetime before this change
 
-CPU is the default. CUDA, DirectML and ROCm require both build-time enablement
-and a compatible ONNX Runtime distribution/device. The existing session cache
+CPU is the default. CUDA, DirectML, ROCm and TensorRT require both build-time
+enablement and a compatible ONNX Runtime distribution/device. TensorRT is
+enabled with `TRANSCRIBE_ONNX_ENABLE_TENSORRT=ON`; the selected ONNX Runtime
+distribution must include its TensorRT execution provider and compatible
+TensorRT/CUDA runtime libraries. The existing session cache
 keys path/provider/device, holds sessions indefinitely and constructs sessions
 while holding its mutex. Graph execution may partition onto CPU even when an
 accelerator is requested. Selecting an accelerator is not evidence that every
@@ -105,16 +108,48 @@ standard-library-only build. This is a C++20 **source API**, not a stable C ABI
 for loading arbitrary binary DLL plugins. Rebuild consumers when public
 aggregate layouts change.
 
-`ModelRegistry` owns definitions and factories, not live model sessions:
+`IInferenceSession` owns one loaded session and keeps inference operations
+independent of ONNX Runtime types. `ModelBackend` aliases this interface so
+existing implementations continue to compile. `IModelProvider` supplies a
+runtime model catalog, an `IModelContract` for each definition, and session
+factories. `IModelRegistry` exposes provider registration, discovery and
+provider-qualified session creation.
 
-- `discover()` lists registered IDs, contract versions, paths, provenance and
-  license declarations without loading weights. Construct with a model path to
-  also register the explicit `onnx:basic-pitch-v1` and
-  `onnx:legacy-pitch-v1` adapters. A path alone is not evidence of its semantics.
-- `create(id)` returns a backend or an explicit `InferenceError`. Its
-  `metadata()` describes capabilities before loading; after loading, ONNX
-  metadata includes actual tensor names, element types and declared dimensions
-  (`-1` denotes a dynamic/symbolic dimension).
+There are two distinct provider selections:
+
+- `ModelRegistration::provider_id` chooses the registered model implementation
+  and catalog source.
+- `ModelLoadOptions::provider` chooses the ONNX Runtime execution provider
+  (CPU, CUDA, DirectML, ROCm or TensorRT) within a session.
+
+`ModelRegistry` owns provider registrations and legacy factories, not live
+model sessions:
+
+- `register_provider(provider)` adds an in-process provider under a unique
+  provider ID. `discover_models()` asks each provider for its current catalog;
+  it does not cache the result or infer model semantics from tensor shapes.
+  Providers may scan their own configured locations, but must return explicit
+  definitions and validate them with an `IModelContract`.
+- `discover_models()` returns `ModelRegistration` records with model
+  definitions, provider IDs, contract IDs and semantic versions. Different
+  providers may expose the same model ID. Use `create_session(id, provider_id)`
+  to select one; omitting the provider ID when multiple registrations match is
+  an explicit ambiguity error.
+- Legacy `discover()` remains a definition-only projection, and
+  `create(id)` remains available for existing callers. Both include registered
+  providers; discovery errors are surfaced as exceptions by `discover()`,
+  while `discover_models()` and `create_session()` return `InferenceError`.
+- Construct with a model path to also register the explicit
+  `onnx:basic-pitch-v1` and `onnx:legacy-pitch-v1` adapters. A path alone is
+  not evidence of its semantics.
+- `create_session(id, provider_id)` returns an `IInferenceSession` or an
+  explicit `InferenceError`. Its `metadata()` describes capabilities before
+  loading; after loading, ONNX metadata includes actual tensor names, element
+  types and declared dimensions (`-1` denotes a dynamic/symbolic dimension).
+- `IModelContract` validates provider-supplied semantics and exposes a stable
+  contract ID and semantic version. Use `ModelContract::Custom` for definitions
+  validated by a custom contract; `ModelRegistry::add` remains for known
+  contracts and legacy factories.
 - Metadata distinguishes accepted source rates (mono, any integral rate at
   least 2000 Hz) from the internal analysis rate, supported MIDI range,
   polyphony, input window/advance/overlap, output frame step, batch size,
@@ -125,14 +160,16 @@ aggregate layouts change.
   and head semantics. `LegacyPitchV1` no longer advertises polyphony solely from
   tensor dimensions: a definition or request must explicitly declare an
   independent multi-pitch objective before a polyphonic request is accepted.
-- `load(options)` selects the provider, device and built-in preview variant.
-  Loading replaces/releases the old session first; failure leaves the instance
-  unloaded, not secretly using the previous model. Loading is synchronous.
+- `load(options)` selects the execution provider, device and built-in preview
+  variant. Loading replaces/releases the old session first; failure leaves the
+  instance unloaded, not secretly using the previous model. Loading is
+  synchronous.
 - `infer(audio, request)` returns the existing notes plus optionally retained
   frame tracks, without introducing score, rendering or exporter dependencies.
   Model ID selects the built-in algorithm; YIN explicitly rejects a polyphonic
   request. Preview is selected at load, not silently switched per request.
-  ONNX request provider/device must match the loaded session.
+  ONNX request provider/device must match the requested provider/device used
+  to load the session, including when an explicit CPU fallback is active.
   Retained aligned fixed-pitch evidence additionally supplies an optional
   `PitchActivationGrid`; unknown objective semantics are never inferred from
   its number of columns.
@@ -228,29 +265,64 @@ RSS returns immediately to its initial value.
 ### Provider policy
 
 `inference_providers()` distinguishes build enablement from providers advertised
-by the **loaded** ONNX Runtime. Availability is not proof that a usable GPU
-device exists; session construction must still succeed. Built-ins require CPU.
-Diagnostics expose requested provider, active provider only after successful
-load, device ID, runtime version and whether CPU fallback was disabled.
+by the **loaded** ONNX Runtime, including TensorRT. Availability is not proof
+that a usable GPU device exists; session construction must still succeed.
+Diagnostics expose requested and active provider/device, runtime version,
+whether CPU fallback was allowed or used, and the reason for a fallback.
 
 Accelerator session options explicitly set
-`session.disable_cpu_ep_fallback=1`. This applies to the shared legacy loading
-path too: a graph requiring unsupported GPU operations may now fail instead of
-silently assigning them to CPU. Select CPU explicitly if that is intended.
-No retry changes providers or backends. This intentional stricter failure
-policy is not a transcription-quality or provider-speed claim.
+`session.disable_cpu_ep_fallback=1`; an accelerator graph requiring unsupported
+operations therefore fails instead of silently assigning them to CPU. The
+`ModelLoadOptions::allow_cpu_fallback` option defaults to false. When enabled,
+the model session explicitly retries as a whole with CPU if the requested
+provider fails to initialize; diagnostics retain the requested provider and
+report CPU as active with a fallback reason. Built-in CPU trackers likewise
+accept a non-CPU request only when this option is enabled. This does not change
+the legacy `transcribe_with_onnx` entry point, which remains strict and has no
+fallback option. Neither successful provider selection nor CPU fallback is an
+accuracy or provider-speed claim.
 
 ### Extending the catalog
 
 For a file with the existing supported tensor/semantic contract, register its
 path, unique model ID, version, provenance and license using `add_onnx`.
-For another rate, layout, label range, activation interpretation or genuine
-incremental protocol, implement `ModelBackend` in a new adapter module and
-register its factory with `ModelRegistry::add`. Compose shipped registrations
-in [inference.cpp](../src/inference.cpp), not in rendering or command-line
-parsing. Factories must return a valid backend; null/throwing factories produce
-explicit errors. New incompatible semantics require a new contract/version,
-not reinterpretation of an existing ID.
+`ModelRegistry::add` remains the compatibility route for known contracts and
+fixed factories. For a runtime catalog or a new backend, implement
+`IModelProvider`, return explicit definitions from `discover_models()`, provide
+an `IModelContract` that validates every definition, and create
+`IInferenceSession` instances. The registry calls provider discovery on each
+request, so a provider can expose models added after registration. Use a
+provider-specific ID when two backends expose the same model ID; there is no
+implicit winner. Compose shipped registrations in
+[inference.cpp](../src/inference.cpp), not in rendering or command-line
+parsing. Provider and session errors are returned explicitly.
+
+### Migration plan
+
+1. Keep existing `ModelBackend` implementations and `ModelRegistry::add` /
+   `create` calls working; `ModelBackend` is now an alias of
+   `IInferenceSession`.
+2. Move each new adapter behind an `IModelProvider`. Give its contract a stable
+   ID and semantic version, and validate tensor names, ranks, types, label
+   meaning, timing, and supported objectives in `IModelContract::validate`.
+   Do not infer semantics from tensor dimensions.
+3. Replace one-time catalog assumptions with
+   `IModelRegistry::discover_models()`. Select by both model ID and provider ID,
+   then create/load the corresponding session. Switching providers means
+   releasing that session and creating another; a failed load never keeps the
+   previous session active.
+4. Set `ModelLoadOptions::allow_cpu_fallback = true` only for workflows that
+   explicitly permit CPU execution. Check diagnostics after load and persist
+   both requested and active providers in benchmark provenance.
+5. Keep `EngineRegistry::add_model` for the shipped model contracts. A custom
+   semantic contract must register a complete `EngineMetadata` and engine
+   factory through `EngineRegistry::add`, so capability declarations are not
+   guessed. Custom contracts also need an adapter-specific bounded-file path
+   before they can use `infer_wav_file`.
+6. Rebuild consumers when public C++ aggregates change. This API is source
+   compatible, not a stable binary plugin ABI; retain old registration
+   overloads until downstream adapters have migrated and a separate deprecation
+   policy is agreed.
 
 The opt-in CLI route is generic:
 
@@ -262,6 +334,12 @@ The opt-in CLI route is generic:
   --backend onnx:basic-pitch-v1 --model .\python\models\basic_pitch.onnx `
   --polyphonic --provider cpu --json notes.json
 ```
+
+For TensorRT builds, configure with
+`-DTRANSCRIBE_ENABLE_ONNX=ON -DTRANSCRIBE_ONNX_ENABLE_TENSORRT=ON` and point
+`ONNXRUNTIME_ROOT` at a matching TensorRT-enabled ONNX Runtime distribution.
+Then use `--provider tensorrt`; the default remains strict, and CPU fallback is
+available only through `ModelLoadOptions::allow_cpu_fallback`.
 
 The `backend` config-file key is also supported. A newly composed registry
 factory is selectable through the same `--backend <id>` branch, without new

@@ -8,6 +8,8 @@
 
 #include "gui_transcription.hpp"
 #include "transcribe/musicxml.hpp"
+#include "transcribe/confidence.hpp"
+#include "transcribe/musical_analysis.hpp"
 #include "transcribe/project.hpp"
 #include "transcribe/review.hpp"
 #include "transcribe/guitar_analysis.hpp"
@@ -977,9 +979,13 @@ std::wstring score_notes_json(const transcribe::ScoreDocument& score) {
     }
     std::wostringstream json;
     json << L'[';
+    const auto confidence = transcribe::score_confidence(score);
+    std::unordered_map<std::string, const transcribe::NoteConfidence*> confidence_by_id;
+    for (const auto& note : confidence.notes) confidence_by_id.emplace(note.note_id, &note);
     for (std::size_t index = 0; index < ordered.size(); ++index) {
         if (index) json << L',';
         const auto& note = *ordered[index];
+        const auto& note_confidence = *confidence_by_id.at(note.id);
         const double start =
             transcribe::score_position_seconds(score, note.onset_quarters);
         const double end = transcribe::score_position_seconds(
@@ -1021,7 +1027,7 @@ std::wstring score_notes_json(const transcribe::ScoreDocument& score) {
              << L",\"measured_start\":" << note.measured_onset_seconds
              << L",\"measured_end\":" << note.measured_offset_seconds
              << L",\"confidence\":";
-        if (note.calibrated_confidence) json << *note.calibrated_confidence;
+        if (note_confidence.calibrated_probability) json << *note_confidence.calibrated_probability;
         else json << L"null";
         if (source_event && score.instrument.name == "Guitar" &&
             !source_event->evidence.empty()) {
@@ -1038,8 +1044,10 @@ std::wstring score_notes_json(const transcribe::ScoreDocument& score) {
                  << L",\"explanation\":\"" << json_escape(from_utf8(technique.explanation))
                  << L"\"}";
         }
-        json << L",\"calibrated_confidence\":";
-        if (note.calibrated_confidence) json << *note.calibrated_confidence;
+        json << L",\"confidence_assessment\":"
+             << from_utf8(transcribe::serialize_note_confidence(note_confidence))
+             << L",\"calibrated_confidence\":";
+        if (note_confidence.calibrated_probability) json << *note_confidence.calibrated_probability;
         else json << L"null";
         json << L",\"amplitude\":";
         if (note.intensity_rms) json << *note.intensity_rms;
@@ -1051,7 +1059,9 @@ std::wstring score_notes_json(const transcribe::ScoreDocument& score) {
         if (source_event) json << source_event->midi_pitch;
         else json << L"null";
         json << L",\"user_authored\":"
-             << (note.user_authored ? L"true" : L"false");
+             << (note.user_authored ? L"true" : L"false")
+             << L",\"user_accepted\":"
+             << (note.user_accepted ? L"true" : L"false");
         json << L",\"source_model\":\""
              << (source_event
                      ? json_escape(from_utf8(source_event->source_model))
@@ -1278,6 +1288,7 @@ std::wstring score_metadata_json(const transcribe::ScoreDocument& score) {
          << L",\"swing_inferred\":" << (metadata.swing_inferred ? L"true" : L"false")
          << L",\"score_id\":\"" << json_escape(from_utf8(score.id))
          << L"\",\"score_revision\":" << score.revision
+         << L",\"correction_count\":" << score.corrections.size()
          << L",\"source_sample_rate\":" << score.source_sample_rate
          << L",\"tempo_map\":[";
     for (std::size_t i = 0; i < score.tempo_map.size(); ++i) {
@@ -1297,7 +1308,11 @@ std::wstring score_metadata_json(const transcribe::ScoreDocument& score) {
              << L",\"denominator\":" << rest.rhythm.denominator
              << L",\"dots\":" << rest.rhythm.dots << L'}';
     }
-    json << L"]}";
+    json << L"],\"confidence_report\":"
+         << from_utf8(transcribe::serialize_confidence_report(transcribe::score_confidence(score)))
+         << L",\"musical_analysis\":" << from_utf8(transcribe::serialize_musical_analysis(
+        transcribe::analyze_musical_structure(
+            transcribe::to_score_interpretation(score).hypotheses.front()))) << L'}';
     return json.str();
 }
 
@@ -1509,6 +1524,14 @@ std::wstring result_json(const CompletionMessage& completion) {
          << (completion.live_capture ? L"true" : L"false")
          << L",\"backend_id\":\""
          << json_escape(from_utf8(completion.live_backend_id)) << L"\"";
+    if (completion.result.polyphonic) {
+        json << L",\"chords\":" << from_utf8(transcribe::serialize_identified_chords(
+            completion.result.polyphonic->chords))
+             << L",\"polyphonic_diagnostics\":{\"refused_note_starts\":"
+             << completion.result.polyphonic->refused_note_starts
+             << L",\"discarded_short_notes\":"
+             << completion.result.polyphonic->discarded_short_notes << L'}';
+    }
     if (completion.request.retain_review_evidence) {
         json << L",\"review\":" << score_review_json(completion.result.score)
              << L",\"review_evidence_truncated\":"
@@ -3119,14 +3142,14 @@ void start_transcription(AppState& state,
             "Choose MusicXML, guitar tab, and score JSON output paths.");
     }
 #ifndef TRANSCRIBE_ENABLE_ONNX
-    if (!request.model_path.empty() || request.polyphonic ||
+    if (!request.model_path.empty() ||
         (request.use_asio && request.live_backend == "onnx")) {
         throw std::runtime_error(
             "ONNX support is not enabled. Configure with -DTRANSCRIBE_ENABLE_ONNX=ON.");
     }
 #endif
-    if (request.polyphonic && request.model_path.empty()) {
-        throw std::invalid_argument("Choose an ONNX model to enable polyphonic inference.");
+    if (request.polyphonic && !request.use_asio && request.bounded_inference) {
+        throw std::invalid_argument("Disable bounded neural windows for tracked polyphonic analysis.");
     }
 
     state.busy = true;
@@ -3498,6 +3521,136 @@ std::vector<transcribe::RecordReviewDecision> parse_review_decisions(
     return decisions;
 }
 
+struct ParsedScoreAction {
+    enum class Kind { Accept, Reject, Pitch, Timing, Insert, Split, Merge };
+    Kind kind{};
+    std::string first_id;
+    std::string second_id;
+    std::string third_id;
+    int midi{};
+    double onset_quarters{};
+    double duration_quarters{};
+};
+
+std::vector<ParsedScoreAction> parse_score_actions(std::string_view encoded) {
+    std::vector<ParsedScoreAction> actions;
+    while (!encoded.empty()) {
+        const auto end = encoded.find(';');
+        const auto record = encoded.substr(0, end);
+        std::array<std::string_view, 5> values{};
+        std::size_t count = 0;
+        std::size_t start = 0;
+        while (true) {
+            if (count == values.size()) {
+                throw std::invalid_argument("A score correction action has too many values.");
+            }
+            const auto separator = record.find(',', start);
+            values[count++] = record.substr(
+                start, separator == std::string_view::npos
+                    ? std::string_view::npos : separator - start);
+            if (separator == std::string_view::npos) break;
+            start = separator + 1;
+        }
+        const auto valid_id = [](std::string_view value) {
+            return !value.empty() && value.size() <= 256 &&
+                value.find_first_of(";,") == std::string_view::npos;
+        };
+        const auto parse_midi = [&](std::string_view value) {
+            const double parsed = parse_number(value, "score action pitch");
+            if (parsed < 0.0 || parsed > 127.0 || std::floor(parsed) != parsed) {
+                throw std::invalid_argument(
+                    "Score action pitch must be an integer MIDI value from 0 to 127.");
+            }
+            return static_cast<int>(parsed);
+        };
+        ParsedScoreAction action;
+        if (values[0] == "accept" || values[0] == "reject") {
+            if (count != 2 || !valid_id(values[1])) {
+                throw std::invalid_argument("A note decision action is malformed.");
+            }
+            action.kind = values[0] == "accept"
+                ? ParsedScoreAction::Kind::Accept
+                : ParsedScoreAction::Kind::Reject;
+            action.first_id = values[1];
+        } else if (values[0] == "pitch") {
+            if (count != 3 || !valid_id(values[1])) {
+                throw std::invalid_argument("A pitch correction action is malformed.");
+            }
+            action.kind = ParsedScoreAction::Kind::Pitch;
+            action.first_id = values[1];
+            action.midi = parse_midi(values[2]);
+        } else if (values[0] == "timing") {
+            if (count != 4 || !valid_id(values[1])) {
+                throw std::invalid_argument("A timing correction action is malformed.");
+            }
+            action.kind = ParsedScoreAction::Kind::Timing;
+            action.first_id = values[1];
+            action.onset_quarters = parse_number(values[2], "corrected onset");
+            action.duration_quarters = parse_number(values[3], "corrected duration");
+            if (action.onset_quarters < 0.0 ||
+                action.onset_quarters > 4096.0 ||
+                action.duration_quarters <= 0.0 ||
+                action.duration_quarters > 4096.0) {
+                throw std::invalid_argument(
+                    "Corrected note timing is outside supported ranges.");
+            }
+        } else if (values[0] == "insert") {
+            if (count != 5 || !valid_id(values[1])) {
+                throw std::invalid_argument("A note insertion action is malformed.");
+            }
+            action.kind = ParsedScoreAction::Kind::Insert;
+            action.first_id = values[1];
+            action.midi = parse_midi(values[2]);
+            action.onset_quarters = parse_number(values[3], "inserted onset");
+            action.duration_quarters =
+                parse_number(values[4], "inserted duration");
+            if (action.onset_quarters < 0.0 ||
+                action.onset_quarters > 4096.0 ||
+                action.duration_quarters <= 0.0 ||
+                action.duration_quarters > 4096.0) {
+                throw std::invalid_argument(
+                    "Inserted note timing is outside supported ranges.");
+            }
+        } else if (values[0] == "split") {
+            if (count != 4 || !valid_id(values[1]) || !valid_id(values[2])) {
+                throw std::invalid_argument("A note split action is malformed.");
+            }
+            action.kind = ParsedScoreAction::Kind::Split;
+            action.first_id = values[1];
+            action.second_id = values[2];
+            action.duration_quarters =
+                parse_number(values[3], "split duration");
+            if (action.duration_quarters <= 0.0 ||
+                action.duration_quarters > 4096.0) {
+                throw std::invalid_argument(
+                    "Note split duration is outside supported ranges.");
+            }
+        } else if (values[0] == "merge") {
+            if (count != 4 || !valid_id(values[1]) || !valid_id(values[2]) ||
+                !valid_id(values[3])) {
+                throw std::invalid_argument("A note merge action is malformed.");
+            }
+            action.kind = ParsedScoreAction::Kind::Merge;
+            action.first_id = values[1];
+            action.second_id = values[2];
+            action.third_id = values[3];
+        } else {
+            throw std::invalid_argument("A score correction action has an unknown operation.");
+        }
+        actions.push_back(std::move(action));
+        if (actions.size() > 10000) {
+            throw std::length_error(
+                "The score editor supports at most 10,000 correction actions.");
+        }
+        if (end == std::string_view::npos) {
+            encoded = {};
+        } else {
+            encoded.remove_prefix(end + 1);
+        }
+    }
+    return actions;
+}
+
 std::vector<transcribe::GuitarTabPosition> parse_tab_positions(
     std::string_view encoded) {
     std::vector<transcribe::GuitarTabPosition> positions;
@@ -3649,6 +3802,16 @@ void export_edited_score(
             throw std::invalid_argument("Project edit generation is invalid.");
         }
     }
+    std::uint64_t score_action_sequence = 0;
+    const auto action_sequence_text = field(fields, "score_action_sequence");
+    if (!action_sequence_text.empty()) {
+        std::size_t sequence_characters = 0;
+        score_action_sequence = std::stoull(
+            action_sequence_text, &sequence_characters);
+        if (sequence_characters != action_sequence_text.size()) {
+            throw std::invalid_argument("Project score-action sequence is invalid.");
+        }
+    }
     const auto revision_text = field(fields, "base_revision");
     std::size_t revision_characters = 0;
     const auto base_revision = std::stoull(revision_text, &revision_characters);
@@ -3663,6 +3826,7 @@ void export_edited_score(
     transcribe::ScoreEditor editor(state.last_result->score);
     const auto source_score = state.last_result->score;
     const auto edited_notes = parse_edited_notes(field(fields, "notes"));
+    const auto score_actions = parse_score_actions(field(fields, "score_actions"));
     std::unordered_set<std::string> edited_ids;
     transcribe::ScoreTransaction transaction;
     transaction.base_revision = base_revision;
@@ -3782,29 +3946,81 @@ void export_edited_score(
     instrument.capo_fret = request.guitar_tab_options.capo_fret;
     transaction.commands.emplace_back(transcribe::UpdateScoreContext{
         metadata, instrument, pickup, tempo_changed});
-    auto editing_timebase = source_score;
-    if (tempo_changed) {
-        editing_timebase.metadata = metadata;
-        editing_timebase.tempo_map = {{0, 0, 0, metadata.tempo_bpm, 1, false}};
+
+    transcribe::ScoreEditor projection_editor(source_score);
+    for (const auto& action : score_actions) {
+        switch (action.kind) {
+        case ParsedScoreAction::Kind::Accept:
+            transaction.commands.emplace_back(
+                transcribe::AcceptScoreNote{action.first_id});
+            break;
+        case ParsedScoreAction::Kind::Reject:
+            transaction.commands.emplace_back(
+                transcribe::RejectScoreNote{action.first_id});
+            break;
+        case ParsedScoreAction::Kind::Pitch:
+            transaction.commands.emplace_back(transcribe::ChangeScorePitch{
+                action.first_id, action.midi});
+            break;
+        case ParsedScoreAction::Kind::Timing: {
+            transcribe::RhythmValue rhythm;
+            rhythm.duration_quarters = action.duration_quarters;
+            rhythm.symbolic = false;
+            transaction.commands.emplace_back(transcribe::ReinterpretScoreRhythm{
+                action.first_id, action.onset_quarters,
+                action.duration_quarters, rhythm});
+            break;
+        }
+        case ParsedScoreAction::Kind::Insert: {
+            transcribe::ScoreNote note;
+            note.id = action.first_id;
+            note.sounding_midi_pitch = action.midi;
+            note.written_midi_pitch =
+                action.midi + instrument.written_transposition_semitones;
+            note.onset_quarters = action.onset_quarters;
+            note.duration_quarters = action.duration_quarters;
+            note.voice = 1;
+            note.rhythm.duration_quarters = action.duration_quarters;
+            transaction.commands.emplace_back(
+                transcribe::InsertScoreNote{std::move(note)});
+            break;
+        }
+        case ParsedScoreAction::Kind::Split:
+            transaction.commands.emplace_back(transcribe::SplitScoreNote{
+                action.first_id, action.duration_quarters, action.second_id});
+            break;
+        case ParsedScoreAction::Kind::Merge:
+            transaction.commands.emplace_back(transcribe::MergeScoreNotes{
+                action.first_id, action.second_id, action.third_id});
+            break;
+        }
     }
+    projection_editor.apply(transaction);
+    const auto projected_note = [&](const std::string& id)
+        -> const transcribe::ScoreNote* {
+        const auto& projected_notes = projection_editor.document().notes;
+        const auto found = std::find_if(
+            projected_notes.begin(), projected_notes.end(),
+            [&](const auto& note) { return note.id == id; });
+        return found == projected_notes.end() ? nullptr : &*found;
+    };
 
     for (std::size_t index = 0; index < edited_notes.size(); ++index) {
         const auto& edited = edited_notes[index];
         if (!edited_ids.insert(edited.id).second) {
             throw std::invalid_argument("Edited score contains a duplicate note ID.");
         }
-        const double onset_quarters =
-            transcribe::score_position_quarters(editing_timebase, edited.note.start_seconds);
+        const auto& editing_timebase = projection_editor.document();
+        const double onset_quarters = transcribe::score_position_quarters(
+            editing_timebase, edited.note.start_seconds);
         const double end_quarters = transcribe::score_position_quarters(
             editing_timebase, edited.note.start_seconds + edited.note.duration_seconds);
         const double duration_quarters = end_quarters - onset_quarters;
         if (duration_quarters <= 0.0) {
             throw std::invalid_argument("Edited note duration is invalid in score time.");
         }
-        const auto current = std::find_if(
-            source_score.notes.begin(), source_score.notes.end(),
-            [&](const auto& note) { return note.id == edited.id; });
-        if (current == source_score.notes.end()) {
+        const auto* current = projected_note(edited.id);
+        if (current == nullptr) {
             if (!edited.id.starts_with("user-")) {
                 throw std::invalid_argument("Edited score contains an unknown note ID.");
             }
@@ -3812,12 +4028,14 @@ void export_edited_score(
             note.id = edited.id;
             note.sounding_midi_pitch = edited.note.midi_pitch;
             note.written_midi_pitch =
-                edited.note.midi_pitch + instrument.written_transposition_semitones;
+                edited.note.midi_pitch +
+                editing_timebase.instrument.written_transposition_semitones;
             note.onset_quarters = onset_quarters;
             note.duration_quarters = duration_quarters;
             note.voice = 1;
             note.rhythm.duration_quarters = duration_quarters;
-            transaction.commands.emplace_back(transcribe::InsertScoreNote{note});
+            transaction.commands.emplace_back(
+                transcribe::InsertScoreNote{std::move(note)});
             continue;
         }
         if (current->sounding_midi_pitch != edited.note.midi_pitch) {
@@ -3828,23 +4046,20 @@ void export_edited_score(
             std::abs(onset_quarters - current->onset_quarters) > 1e-5 ||
             std::abs(duration_quarters - current->duration_quarters) > 1e-5;
         if (timing_changed) {
-            auto rhythm = current->rhythm;
-            rhythm.denominator = 0;
-            rhythm.dots = 0;
-            rhythm.tuplet_actual = 0;
-            rhythm.tuplet_normal = 0;
+            transcribe::RhythmValue rhythm;
             rhythm.duration_quarters = duration_quarters;
-            rhythm.fit_error_quarters = 0.0;
             rhythm.symbolic = false;
-            transaction.commands.emplace_back(transcribe::ReinterpretScoreRhythm{
+            transaction.commands.emplace_back(
+                transcribe::ReinterpretScoreRhythm{
                 edited.id, onset_quarters, duration_quarters, rhythm});
         }
     }
-    for (const auto& note : source_score.notes) {
-        if (!edited_ids.contains(note.id)) {
-            transaction.commands.emplace_back(
-                transcribe::DeleteScoreElement{note.id});
-        }
+    std::vector<std::string> removed_note_ids;
+    for (const auto& note : projection_editor.document().notes) {
+        if (!edited_ids.contains(note.id)) removed_note_ids.push_back(note.id);
+    }
+    for (const auto& id : removed_note_ids) {
+        transaction.commands.emplace_back(transcribe::DeleteScoreElement{id});
     }
     const auto manual_positions =
         parse_tab_positions(field(fields, "tab_positions"));
@@ -4049,7 +4264,9 @@ void export_edited_score(
         queue_project_autosave(state, project, edit_generation);
         post_json(state, L"{\"type\":\"project-autosaving\","
             L"\"score_revision\":" + std::to_wstring(result.score.revision) +
-            L",\"generation\":" + std::to_wstring(edit_generation) + L"}");
+            L",\"generation\":" + std::to_wstring(edit_generation) +
+            L",\"score_action_sequence\":" +
+                std::to_wstring(score_action_sequence) + L"}");
         if (!field(fields, "relink_audio").empty())
             post_json(state, L"{\"type\":\"project-relinked\",\"project\":" +
                 project_summary_json(project, state.project_path) + L"}");
